@@ -141,7 +141,7 @@ langchain==0.3.27
     #   langchain-community
 langchain-community==0.3.29
     # via nemoguardrails (pyproject.toml)
-langchain-core==0.3.76
+langchain-core==0.3.81
     # via
     #   nemoguardrails (pyproject.toml)
     #   langchain
