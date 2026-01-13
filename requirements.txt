@@ -70,7 +70,7 @@ fastapi==0.122.0
     # via nemoguardrails (pyproject.toml)
 fastembed==0.6.0
     # via nemoguardrails (pyproject.toml)
-filelock==3.19.1
+filelock==3.20.3
     # via
     #   huggingface-hub
     #   tldextract
