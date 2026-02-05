@@ -252,7 +252,7 @@ propcache==0.3.2
     # via
     #   aiohttp
     #   yarl
-protobuf==6.32.1
+protobuf==6.33.5
     # via
     #   nemoguardrails (pyproject.toml)
     #   onnxruntime
