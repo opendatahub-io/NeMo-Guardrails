@@ -53,7 +53,7 @@ confection==0.1.5
     # via
     #   thinc
     #   weasel
-cryptography==44.0.3
+cryptography==46.0.5
     # via presidio-anonymizer
 cymem==2.0.11
     # via
