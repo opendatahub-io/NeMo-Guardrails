@@ -48,7 +48,7 @@ RUN set -ex && \
     dnf clean all && \
     rm -rf /var/cache/dnf
 
-FROM registry.access.redhat.com/ubi9/python-312:latest as runtime
+FROM registry.access.redhat.com/ubi9/python-312-minimal:latest as runtime
 
 USER 0
 WORKDIR /app
