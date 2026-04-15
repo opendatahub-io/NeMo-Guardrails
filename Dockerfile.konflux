@@ -157,8 +157,9 @@ ARG TARGETARCH
 ARG GUARDRAILS_PROFILE=opensource
 ENV LD_LIBRARY_PATH=/usr/local/lib64:/usr/local/lib:/usr/lib64:/usr/lib:/app/.openblas/lib
 ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig/:/app/.openblas/lib/pkgconfig
-ENV PATH="$HOME/.cargo/bin:$PATH"
+ENV PATH="$HOME/.cargo/bin:/app/.venv/bin:$PATH"
 ENV BLIS_ARCH=generic
+ENV GRPC_PYTHON_BUILD_SYSTEM_OPENSSL=1
 
 COPY requirements.txt requirements-torch.txt pyproject.toml README.md ./
 COPY nemoguardrails/ ./nemoguardrails/
@@ -199,6 +200,13 @@ RUN --mount=type=cache,from=torch-builder,source=/torchwheels/,target=/tmp/torch
             /tmp/onnxruntime_wheels/*.whl  \
             /tmp/hf_xet_wheels/*.whl && \
         PREFIX=/app/.openblas make -C /tmp/openblas install && rm -rf /tmp/openblas     ; \
+    fi
+
+# Temporary workaround for ppc64le with the pinned pandas version. Remove after upgrading pandas with v3.x
+RUN if [ "$TARGETARCH" == "ppc64le" ]; then     \
+        export PANDAS_VERSION=$(sed -n "s/^pandas==//p" /app/requirements.txt) && \
+        /app/.venv/bin/pip install --no-cache-dir "meson<1.10" meson-python ninja cython numpy versioneer[toml] packaging && \
+        /app/.venv/bin/pip install --no-cache-dir --no-build-isolation pandas==${PANDAS_VERSION} ; \
     fi
 
 RUN /app/.venv/bin/pip install --no-cache-dir -r requirements.txt && \
