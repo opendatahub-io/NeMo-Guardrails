@@ -1,7 +1,7 @@
 ###############################################################
 # Stage 1 Base builder image with common tooling
 ###############################################################
-FROM registry.access.redhat.com/ubi9/python-312@sha256:0abad955c2c2e4575dc8987d76b8c49a7dd8e0679063e3118dab03c54528232f as packages-build
+FROM registry.access.redhat.com/ubi9/python-312@sha256:cb818db6c1dc82c70aeaa1139e33f3371f47b97b60ae6f9f23381319746f6f1d as packages-build
 
 USER root
 WORKDIR /app
@@ -148,7 +148,7 @@ RUN if [ "$TARGETARCH" = "ppc64le" ]; then \
 # Stage 7 Install all the dependencies
 ###############################################################
 
-FROM registry.access.redhat.com/ubi9/python-312@sha256:0abad955c2c2e4575dc8987d76b8c49a7dd8e0679063e3118dab03c54528232f as build
+FROM registry.access.redhat.com/ubi9/python-312@sha256:cb818db6c1dc82c70aeaa1139e33f3371f47b97b60ae6f9f23381319746f6f1d as build
 
 USER 0
 WORKDIR /app
