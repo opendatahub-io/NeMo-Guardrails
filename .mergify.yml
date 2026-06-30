@@ -1,10 +1,11 @@
 pull_request_rules:
-  - name: Backport merged PRs from develop → incubation
+  - name: Backport merged PRs from develop → incubation (skip .tekton-only changes)
     conditions:
       - base=develop
       - merged
       - author!=mergify[bot]
       - repository-full-name=opendatahub-io/NeMo-Guardrails
+      - files~=^(?!\.tekton/).+
     actions:
       backport:
         branches:
