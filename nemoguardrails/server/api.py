@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import asyncio
-import copy
 import importlib.util
 import json
 import logging
@@ -23,7 +22,6 @@ import re
 import time
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from typing import Any, AsyncIterator, Callable, List, Optional, Union
 
 import httpx
@@ -32,29 +30,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from openai.types.chat.chat_completion import Choice
 from openai.types.chat.chat_completion_message import ChatCompletionMessage
 from pydantic import BaseModel, ValidationError
-from starlette.responses import StreamingResponse
-from starlette.staticfiles import StaticFiles
+from starlette.responses import RedirectResponse, StreamingResponse
 
 from nemoguardrails import LLMRails, RailsConfig, utils
-from nemoguardrails.context import api_request_headers_var
+from nemoguardrails.header_forwarding import api_request_headers_var
 from nemoguardrails.rails.llm.config import Model
-from nemoguardrails.rails.llm.options import (
-    ActivatedRail,
-    GenerationLog,
-    GenerationLogOptions,
-    GenerationOptions,
-    GenerationRailsOptions,
-    GenerationResponse,
-    GenerationStats,
-)
+from nemoguardrails.rails.llm.options import GenerationOptions, GenerationResponse
 from nemoguardrails.server.datastore.datastore import DataStore
 from nemoguardrails.server.schemas.openai import (
-    GuardrailCheckResponse,
     GuardrailsChatCompletion,
     GuardrailsChatCompletionRequest,
-    MessageCheckResult,
     OpenAIModelsList,
-    RailStatus,
 )
 from nemoguardrails.server.schemas.utils import (
     create_error_chat_completion,
@@ -63,6 +49,11 @@ from nemoguardrails.server.schemas.utils import (
     format_streaming_chunk_as_sse,
     generation_response_to_chat_completion,
 )
+
+try:
+    from chainlit.utils import mount_chainlit
+except ImportError:
+    mount_chainlit = None
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -76,7 +67,7 @@ class GuardrailsApp(FastAPI):
         # Initialize custom attributes
         self.default_config_id: Optional[str] = None
         self.rails_config_path: str = ""
-        self.disable_chat_ui: bool = False
+        self.disable_chat_ui: bool = os.getenv("NEMO_GUARDRAILS_DISABLE_CHAT_UI", "false").lower() == "true"
         self.auto_reload: bool = False
         self.stop_signal: bool = False
         self.single_config_mode: bool = False
@@ -89,7 +80,38 @@ class GuardrailsApp(FastAPI):
 # backends and storage engines.
 registered_loggers: List[Callable] = []
 
-api_description = """Guardrails Sever API."""
+
+def _raise_invalid_state(detail: str) -> None:
+    raise HTTPException(status_code=422, detail=detail)
+
+
+def _validate_public_state_shape(state: Optional[dict]) -> None:
+    """Validate request state shape before loading rails config.
+
+    At the public HTTP boundary, the only accepted non-empty dict state shape is
+    Colang 1.0 transcript state: {"events": [...]}. Colang 2.0 has no safe
+    public dict state shape.
+    """
+    if state is None or state == {}:
+        return
+
+    if state.get("version") == "2.x" or "state" in state:
+        _raise_invalid_state(
+            "Caller-supplied state is not accepted for Colang 2.0 over HTTP. "
+            "Full Colang 2.0 flow-state continuation over HTTP is not currently supported."
+        )
+
+    if "events" not in state:
+        _raise_invalid_state(
+            "Invalid state format: state must contain an 'events' key. "
+            "Use an empty dict {} to start a new conversation."
+        )
+
+    if not isinstance(state["events"], list):
+        _raise_invalid_state("Invalid state format: 'events' must be a list.")
+
+
+api_description = """Guardrails Server API."""
 
 # The datastore that the Server should use.
 # This is currently used only for storing threads.
@@ -102,16 +124,23 @@ datastore: Optional[DataStore] = None
 async def lifespan(app: GuardrailsApp):
     # Startup logic here
     """Register any additional challenges, if available at startup."""
+    from nemoguardrails.telemetry import DeploymentTypeEnum, set_deployment_type
+
+    set_deployment_type(DeploymentTypeEnum.API.value)
+
     challenges_files = os.path.join(app.rails_config_path, "challenges.json")
 
     if os.path.exists(challenges_files):
         with open(challenges_files) as f:
             register_challenges(json.load(f))
 
-    # If there is a `config.yml` in the root `app.rails_config_path`, then
-    # that means we are in single config mode.
-    if os.path.exists(os.path.join(app.rails_config_path, "config.yml")) or os.path.exists(
-        os.path.join(app.rails_config_path, "config.yaml")
+    # If there is a `config.yml` in the root `app.rails_config_path` (or in
+    # a `config/` subdirectory), set the app to single config mode.
+    if (
+        os.path.exists(os.path.join(app.rails_config_path, "config.yml"))
+        or os.path.exists(os.path.join(app.rails_config_path, "config.yaml"))
+        or os.path.exists(os.path.join(app.rails_config_path, "config", "config.yml"))
+        or os.path.exists(os.path.join(app.rails_config_path, "config", "config.yaml"))
     ):
         app.single_config_mode = True
         app.single_config_id = os.path.basename(app.rails_config_path)
@@ -131,25 +160,6 @@ async def lifespan(app: GuardrailsApp):
             # If there is an `init` function, we call it with the reference to the app.
             if config_module is not None and hasattr(config_module, "init"):
                 config_module.init(app)
-
-    # Finally, we register the static frontend UI serving
-
-    if not app.disable_chat_ui:
-        FRONTEND_DIR = utils.get_chat_ui_data_path("frontend")
-
-        app.mount(
-            "/",
-            StaticFiles(
-                directory=FRONTEND_DIR,
-                html=True,
-            ),
-            name="chat",
-        )
-    else:
-
-        @app.get("/")
-        async def root_handler():
-            return {"status": "ok"}
 
     if app.auto_reload:
         app.loop = asyncio.get_running_loop()
@@ -198,9 +208,6 @@ app.default_config_id = None
 # By default, we use the rails in the examples folder
 app.rails_config_path = utils.get_examples_data_path("bots")
 
-# Weather the chat UI is enabled or not.
-app.disable_chat_ui = False
-
 # auto reload flag
 app.auto_reload = False
 
@@ -231,11 +238,7 @@ async def get_rails_configs():
         if os.path.isdir(os.path.join(app.rails_config_path, f))
         and f[0] != "."
         and f[0] != "_"
-        # We filter out all the configs for which there is no `config.yml` file.
-        and (
-            os.path.exists(os.path.join(app.rails_config_path, f, "config.yml"))
-            or os.path.exists(os.path.join(app.rails_config_path, f, "config.yaml"))
-        )
+        and _has_config_file(os.path.join(app.rails_config_path, f))
     ]
 
     return [{"id": config_id} for config_id in config_ids]
@@ -281,6 +284,16 @@ llm_rails_instances: dict[str, LLMRails] = {}
 llm_rails_events_history_cache: dict[str, dict] = {}
 
 
+def _has_config_file(path: str) -> bool:
+    """Check if a directory (or its 'config' subdirectory) contains a config.yml/yaml."""
+    for candidate in [path, os.path.join(path, "config")]:
+        if os.path.exists(os.path.join(candidate, "config.yml")) or os.path.exists(
+            os.path.join(candidate, "config.yaml")
+        ):
+            return True
+    return False
+
+
 def _generate_cache_key(config_ids: List[str], model_name: Optional[str] = None) -> str:
     """Generates a cache key for the given config ids and model name."""
     key = "-".join(config_ids)
@@ -316,7 +329,7 @@ def _update_models_in_config(config: RailsConfig, main_model: Model) -> RailsCon
     return config.model_copy(update={"models": models})
 
 
-def _get_rails(config_ids: List[str], model_name: Optional[str] = None) -> LLMRails:
+async def _get_rails(config_ids: List[str], model_name: Optional[str] = None) -> LLMRails:
     """Returns the rails instance for the given config id and model.
 
     Args:
@@ -390,9 +403,9 @@ def _get_rails(config_ids: List[str], model_name: Optional[str] = None) -> LLMRa
 
 class ChunkErrorMetadata(BaseModel):
     message: str
-    type: str
-    param: str
-    code: str
+    type: Optional[str] = None
+    param: Optional[str] = None
+    code: Optional[str] = None
 
 
 class ChunkError(BaseModel):
@@ -495,8 +508,10 @@ async def chat_completion(body: GuardrailsChatCompletionRequest, request: Reques
                 detail="No guardrails config_id provided and server has no default configuration",
             )
 
+    _validate_public_state_shape(body.guardrails.state)
+
     try:
-        llm_rails = _get_rails(config_ids, model_name=body.model)
+        llm_rails = await _get_rails(config_ids, model_name=body.model)
 
     except ValueError as e:
         log.exception(e)
@@ -504,6 +519,22 @@ async def chat_completion(body: GuardrailsChatCompletionRequest, request: Reques
             model=body.model,
             error_message=f"Could not load the {config_ids} guardrails configuration. An internal error has occurred.",
             config_id=config_ids[0] if config_ids else None,
+        )
+
+    # Version-aware state validation, now that the config is loaded.
+    # 1.0 accepts the pre-validated {"events": [...]} transcript. 2.0 has no
+    # valid public dict state shape.
+    if body.guardrails.state is not None and body.guardrails.state != {}:
+        if llm_rails.config.colang_version != "1.0":
+            raise HTTPException(
+                status_code=422,
+                detail="Stateful continuation over HTTP is not supported for Colang 2.0.",
+            )
+
+    if body.guardrails.thread_id and llm_rails.config.colang_version != "1.0":
+        raise HTTPException(
+            status_code=422,
+            detail="thread_id message-history replay is not supported for Colang 2.0.",
         )
 
     try:
@@ -534,14 +565,6 @@ async def chat_completion(body: GuardrailsChatCompletionRequest, request: Reques
             messages = thread_messages + messages
 
         generation_options = body.guardrails.options
-
-        # Validate state format if provided
-        if body.guardrails.state is not None and body.guardrails.state != {}:
-            if "events" not in body.guardrails.state and "state" not in body.guardrails.state:
-                raise HTTPException(
-                    status_code=422,
-                    detail="Invalid state format: state must contain 'events' or 'state' key. Use an empty dict {} to start a new conversation.",
-                )
 
         # Initialize llm_params if not already set
         if generation_options.llm_params is None:
@@ -626,609 +649,10 @@ async def chat_completion(body: GuardrailsChatCompletionRequest, request: Reques
         )
 
 
-# =============================================================================
-# Guardrails Checks Endpoint
-# =============================================================================
+# Include fork-specific checks endpoint router
+from nemoguardrails.server.checks import router as checks_router  # noqa: E402
 
-
-@dataclass
-class _CheckLog:
-    """Log data for check result."""
-
-    activated_rails: List[ActivatedRail]
-    stats: Optional[GenerationStats] = None
-
-
-@dataclass
-class _ToolOutputCheckResult:
-    """Result object for tool output rail checks."""
-
-    response: List[dict]
-    log: _CheckLog
-
-    @classmethod
-    def create(cls, activated_rails: List[ActivatedRail], blocked_message: Optional[str]):
-        """Create a tool output check result."""
-        response = [{"role": "assistant", "content": blocked_message}] if blocked_message else []
-        log = _CheckLog(activated_rails=activated_rails, stats=None)
-        return cls(response=response, log=log)
-
-
-def _load_rails_for_check(
-    config_id: Optional[str] = None,
-    config_ids: Optional[List[str]] = None,
-    config: Optional[dict] = None,
-    model_name: Optional[str] = None,
-) -> LLMRails:
-    """Load rails from either config_id(s) or inline config.
-
-    Args:
-        config_id: ID of a server-configured guardrail config
-        config_ids: List of config IDs to combine
-        config: Inline guardrail configuration
-        model_name: Model name from request (used when inline config has no models)
-
-    Returns:
-        LLMRails instance
-    """
-    if config:
-        # Process inline config
-        if isinstance(config, dict):
-            config = _process_inline_config(config, model_name)
-
-        rails_config = (
-            RailsConfig.from_content(yaml_content=config)
-            if isinstance(config, str)
-            else RailsConfig.from_content(config=config)
-        )
-        return LLMRails(config=rails_config, verbose=True)
-
-    # Use config_id(s) from server
-    if config_ids:
-        return _get_rails(config_ids, model_name=model_name)
-    if config_id:
-        return _get_rails([config_id], model_name=model_name)
-
-    raise ValueError("Either config, config_id, or config_ids must be provided")
-
-
-def _build_model_dict(model: Model) -> dict[str, Any]:
-    """Build model dictionary for inline config from Model object."""
-    model_dict: dict[str, Any] = {"type": model.type, "engine": model.engine}
-    params = dict(model.parameters) if model.parameters else {}
-
-    if model.model:
-        params["model_name"] = model.model
-
-    if params:
-        model_dict["parameters"] = params
-
-    return model_dict
-
-
-def _override_main_model_name(models: list, model_name: str) -> None:
-    """Override the main model's name in a list of model configs.
-
-    Args:
-        models: List of model config dicts to search and modify
-        model_name: Model name to set on the main model
-    """
-    for model in models:
-        if isinstance(model, dict) and model.get("type") == "main":
-            if "parameters" in model:
-                if not isinstance(model["parameters"], dict):
-                    model["parameters"] = {}
-                model["parameters"]["model_name"] = model_name
-            else:
-                model["model"] = model_name
-            return
-
-    log.warning(f"No main model found in config to override with '{model_name}'")
-
-
-def _validate_model_list(models: list) -> None:
-    """Validate that all items in models list are dicts.
-
-    Args:
-        models: List of model configs to validate
-
-    Raises:
-        ValueError: If any model is not a dict
-    """
-    for idx, model in enumerate(models):
-        if not isinstance(model, dict):
-            raise ValueError(f"Invalid model at index {idx}: expected dict, got {type(model).__name__}")
-
-
-def _inherit_models_from_server(server_config_id: str) -> list:
-    """Load and return models from server config.
-
-    Args:
-        server_config_id: ID of server config to inherit from
-
-    Returns:
-        List of model config dicts
-
-    Raises:
-        ValueError: If server config cannot be loaded or has no models
-    """
-    try:
-        default_rails = _get_rails([server_config_id])
-        if not default_rails.config.models:
-            raise ValueError(f"Server config '{server_config_id}' has no models defined")
-        return [_build_model_dict(model) for model in default_rails.config.models]
-    except ValueError:
-        raise
-    except Exception as e:
-        raise ValueError(f"Could not inherit models from server config '{server_config_id}': {e}") from e
-
-
-def _process_inline_config(config: dict, model_name: Optional[str]) -> dict:
-    """Process inline config to ensure it has valid models.
-
-    Handles three scenarios:
-    1. Config has explicit models - validate them
-    2. Config has no models but server has default - inherit them
-    3. Config has no models and no server default - error
-
-    Args:
-        config: Inline config dict
-        model_name: Optional model name to override in final config
-
-    Returns:
-        Processed config dict with models
-
-    Raises:
-        ValueError: If config is invalid or cannot be processed
-    """
-    models = config.get("models")
-
-    # Validate models field type
-    if models is not None and not isinstance(models, list):
-        raise ValueError(f"Invalid inline config: 'models' must be a list, got {type(models).__name__}")
-
-    models = models if models is not None else []
-    server_config_id = app.default_config_id or app.single_config_id
-    config = copy.deepcopy(config)
-
-    if models:
-        # Scenario 1: Explicit models provided
-        _validate_model_list(config["models"])
-    elif server_config_id:
-        # Scenario 2: Inherit from server config
-        config["models"] = _inherit_models_from_server(server_config_id)
-        log.info(
-            f"Inherited {len(config['models'])} model(s) from server config '{server_config_id}'"
-            + (f", overriding main model with '{model_name}'" if model_name else "")
-        )
-    else:
-        # Scenario 3: No models and no server config
-        raise ValueError(
-            "Inline config has no models defined. Either provide explicit model configuration "
-            "or ensure the server is configured with a default config (--default-config-id)."
-        )
-
-    # Override main model name if requested
-    if model_name:
-        _override_main_model_name(config["models"], model_name)
-
-    return config
-
-
-def _convert_tool_call_to_nemo_format(tool_call: dict) -> dict:
-    """Convert OpenAI-style tool call to NeMo format."""
-    if "function" in tool_call:
-        # OpenAI format
-        args = tool_call["function"]["arguments"]
-        return {
-            "id": tool_call.get("id", ""),
-            "name": tool_call["function"]["name"],
-            "args": json.loads(args) if isinstance(args, str) else args,
-            "type": "tool_call",
-        }
-    # Already in NeMo format
-    return tool_call
-
-
-async def _check_tool_output_rails(llm_rails: LLMRails, tool_calls: list) -> _ToolOutputCheckResult:
-    """Check tool output rails and return a result object."""
-    nemo_tool_calls = [_convert_tool_call_to_nemo_format(tc) for tc in tool_calls]
-    events = [utils.new_event_dict("BotToolCalls", tool_calls=nemo_tool_calls)]
-    result_events = await llm_rails.runtime.generate_events(events)
-
-    # Extract activated rails and blocked message
-    activated_rail_names: List[str] = [
-        str(event.get("flow_id"))
-        for event in result_events
-        if event.get("type") == "StartToolOutputRail" and event.get("flow_id")
-    ]
-    blocked_message = next(
-        (event.get("script") for event in result_events if event.get("type") == "StartUtteranceBotAction"),
-        None,
-    )
-
-    # Create rail objects with blocking status
-    is_blocked = blocked_message is not None
-    rail_objects = [
-        ActivatedRail(
-            type="tool_output",
-            name=name,
-            stop=is_blocked,
-            decisions=[],
-            executed_actions=[],
-        )
-        for name in activated_rail_names
-    ]
-
-    return _ToolOutputCheckResult.create(rail_objects, blocked_message)
-
-
-def _get_config_ids_from_request(
-    body: GuardrailsChatCompletionRequest,
-) -> Optional[List[str]]:
-    """Get config IDs from request or server default."""
-    if body.guardrails.config_ids:
-        return body.guardrails.config_ids
-
-    server_config_id = app.default_config_id or app.single_config_id
-    if server_config_id:
-        return [server_config_id]
-
-    return None
-
-
-def _create_check_error_response(error: str, details: Optional[str] = None) -> GuardrailCheckResponse:
-    """Create a standardized error response for guardrail checks."""
-    guardrails_data = {"error": error}
-    if details:
-        guardrails_data["details"] = details
-    return GuardrailCheckResponse(status="error", rails_status={}, guardrails_data=guardrails_data)
-
-
-def _create_check_options(
-    run_input: bool = False,
-    run_output: bool = False,
-    run_tool_input: bool = False,
-    run_tool_output: bool = False,
-) -> GenerationOptions:
-    """Create GenerationOptions for guardrail checks.
-
-    All LLM and rail parameters come from the guardrail configuration.
-    """
-    return GenerationOptions(
-        rails=GenerationRailsOptions(
-            input=run_input,
-            output=run_output,
-            retrieval=False,
-            dialog=False,
-            tool_input=run_tool_input,
-            tool_output=run_tool_output,
-        ),
-        log=GenerationLogOptions(activated_rails=True, internal_events=True, llm_calls=True),
-    )
-
-
-def _calculate_check_status(rails_status: dict[str, RailStatus]) -> str:
-    """Calculate overall status from rails status dictionary."""
-    return "blocked" if any(s.status == "blocked" for s in rails_status.values()) else "success"
-
-
-def _has_response_content(result: Union[GenerationResponse, _ToolOutputCheckResult]) -> bool:
-    """Check if result has a non-empty response."""
-    return hasattr(result, "response") and bool(result.response)
-
-
-def _is_rail_blocked(
-    rail: ActivatedRail, role: str, msg: dict, result: Union[GenerationResponse, _ToolOutputCheckResult]
-) -> bool:
-    """Determine if a rail blocked execution."""
-    if getattr(rail, "stop", False):
-        return True
-
-    # Tool_input rails use abort which doesn't set stop=True (NeMo quirk)
-    if role == "tool":
-        if _has_response_content(result) and isinstance(result.response[0], dict):
-            return result.response[0].get("content", "").strip() != ""
-        return False
-
-    # Tool_output rails block if they generated a response
-    if role == "assistant" and "tool_calls" in msg:
-        return _has_response_content(result)
-
-    return False
-
-
-def _update_rails_status(
-    rails_status: dict[str, RailStatus],
-    message_rails: dict[str, RailStatus],
-    rail: ActivatedRail,
-    is_blocked: bool,
-):
-    """Update both aggregated and per-message rails status."""
-    status = "blocked" if is_blocked else "success"
-    rail_name = getattr(rail, "name", "unknown")
-    rail_status = RailStatus(status=status)
-
-    if rail_name not in rails_status or status == "blocked":
-        rails_status[rail_name] = rail_status
-
-    message_rails[rail_name] = rail_status
-
-
-def _merge_stats(aggregated_log: GenerationLog, new_stats: GenerationStats):
-    """Merge generation stats into aggregated log."""
-    for field_name, new_value in new_stats.model_dump().items():
-        if new_value is not None and isinstance(new_value, (int, float)):
-            current_value = getattr(aggregated_log.stats, field_name) or 0
-            setattr(aggregated_log.stats, field_name, current_value + new_value)
-
-
-def _process_result_log(
-    result: Union[GenerationResponse, _ToolOutputCheckResult],
-    role: str,
-    msg: dict,
-    rails_status: dict[str, RailStatus],
-    message_rails: dict[str, RailStatus],
-    aggregated_log: GenerationLog,
-):
-    """Process result log and update rails status."""
-    if not (hasattr(result, "log") and result.log):
-        return
-
-    if hasattr(result.log, "activated_rails") and result.log.activated_rails:
-        for rail in result.log.activated_rails:
-            is_blocked = _is_rail_blocked(rail, role, msg, result)
-            _update_rails_status(rails_status, message_rails, rail, is_blocked)
-            aggregated_log.activated_rails.append(rail)
-
-    if hasattr(result.log, "stats") and result.log.stats:
-        _merge_stats(aggregated_log, result.log.stats)
-
-
-def _build_final_response(
-    rails_status: dict[str, RailStatus],
-    message_results: List[MessageCheckResult],
-    aggregated_log: GenerationLog,
-) -> GuardrailCheckResponse:
-    """Build final guardrail check response."""
-    guardrails_data = {
-        "log": {
-            "activated_rails": [rail.name for rail in aggregated_log.activated_rails if rail.stop],
-            "stats": aggregated_log.stats.model_dump() if aggregated_log.stats else {},
-        }
-    }
-
-    return GuardrailCheckResponse(
-        status=_calculate_check_status(rails_status),
-        rails_status=rails_status,
-        messages=message_results,
-        guardrails_data=guardrails_data,
-    )
-
-
-def _json_response(response: GuardrailCheckResponse) -> str:
-    """Convert response to JSON string with newline."""
-    return json.dumps(response.model_dump()) + "\n"
-
-
-async def _process_message(
-    llm_rails: LLMRails, msg: dict, role: str, content: str
-) -> tuple[Optional[Union[GenerationResponse, _ToolOutputCheckResult]], Optional[GenerationOptions]]:
-    """Process a single message and return result and options.
-
-    Returns:
-        Tuple of (result, options). If result is provided, options will be None.
-        If options is provided, result will be None and caller should generate.
-
-    Raises:
-        ValueError: If the message role is not supported
-    """
-    if role == "user":
-        return None, _create_check_options(run_input=True)
-
-    if role == "system":
-        return None, _create_check_options(run_input=True)
-
-    if role == "assistant":
-        if "tool_calls" in msg:
-            # Tool output rails - validate tool calls before execution
-            result = await _check_tool_output_rails(llm_rails, msg["tool_calls"])
-            return result, None
-        # Regular output rails - validate assistant responses
-        return None, _create_check_options(run_output=True)
-
-    if role == "tool":
-        # Tool messages trigger tool_input rails (validate tool responses)
-        return None, _create_check_options(run_tool_input=True)
-
-    # Unsupported role
-    raise ValueError(f"Unsupported message role: '{role}'. Supported roles are: 'user', 'system', 'assistant', 'tool'.")
-
-
-def _build_check_messages(role: str, content: str, msg: dict) -> List[dict]:
-    """Build messages list for rail checking based on role.
-
-    Args:
-        role: The message role
-        content: The message content
-        msg: The original message dict
-
-    Returns:
-        List of messages to pass to the rails
-
-    Raises:
-        ValueError: If the message role is not supported
-    """
-    if role == "user":
-        return [{"role": "user", "content": content}]
-
-    if role == "system":
-        return [{"role": "user", "content": content}]
-
-    if role == "assistant":
-        return [
-            {"role": "user", "content": ""},
-            {"role": "assistant", "content": content},
-        ]
-
-    if role == "tool":
-        tool_msg = {"role": "tool", "content": content}
-        tool_msg.update({k: msg[k] for k in ["name", "tool_call_id"] if k in msg})
-        return [tool_msg]
-
-    # This should never be reached since _process_message validates the role first
-    raise ValueError(f"Unsupported message role: '{role}'. Supported roles are: 'user', 'system', 'assistant', 'tool'.")
-
-
-@app.post(
-    "/v1/guardrail/checks",
-    response_model=GuardrailCheckResponse,
-)
-async def guardrail_checks(body: GuardrailsChatCompletionRequest, request: Request):
-    """Check messages against guardrails without generating LLM responses.
-
-    This endpoint validates messages against configured guardrails using role-based routing:
-    - user messages: evaluated by input rails
-    - system messages: evaluated by input rails
-    - assistant messages: evaluated by output rails
-    - tool messages: evaluated by tool_input rails
-
-    Args:
-        body: GuardrailsChatCompletionRequest with messages and guardrail configuration
-        request: FastAPI request object (headers captured for guardrail actions)
-
-    Returns:
-        GuardrailCheckResponse with status and rails_status for each evaluated rail
-    """
-    log.info("Got guardrail check request for config %s", body.guardrails.config_id)
-    for logger in registered_loggers:
-        asyncio.get_event_loop().create_task(
-            logger(
-                {
-                    "endpoint": "/v1/guardrail/checks",
-                    "body": body.model_dump_json(),
-                }
-            )
-        )
-
-    api_request_headers_var.set(dict(request.headers))
-
-    async def process_checks():
-        """Process guardrail checks and yield results.
-
-        Messages are checked independently based on role:
-        - user messages: input rails
-        - system messages: input rails
-        - assistant messages: output rails
-        - tool messages: tool_input rails
-        """
-        try:
-            # Validate messages
-            if not body.messages:
-                yield _json_response(_create_check_error_response("Messages list cannot be empty."))
-                return
-
-            # Load rails configuration
-            try:
-                if body.guardrails.config:
-                    llm_rails = _load_rails_for_check(config=body.guardrails.config, model_name=body.model)
-                else:
-                    config_ids = _get_config_ids_from_request(body)
-                    if not config_ids:
-                        yield _json_response(
-                            _create_check_error_response(
-                                "No guardrails configuration provided and no default configuration set on server."
-                            )
-                        )
-                        return
-                    llm_rails = _load_rails_for_check(config_ids=config_ids, model_name=body.model)
-            except Exception as e:
-                log.exception(e)
-                error_msg = (
-                    "Failed to load inline guardrails configuration."
-                    if body.guardrails.config
-                    else "Could not load guardrails configuration."
-                )
-                yield _json_response(_create_check_error_response(error_msg, str(e)))
-                return
-
-            rails_status = {}
-            message_results = []
-
-            # Use NeMo's GenerationLog for accumulation instead of manual tracking
-            aggregated_log = GenerationLog(activated_rails=[], stats=GenerationStats())
-
-            # Process each message independently based on role
-            for msg_idx, msg in enumerate(body.messages):
-                # Pydantic validates messages is List[dict], but role might be missing or not a string
-                if "role" not in msg:
-                    log.warning(f"Skipping message at index {msg_idx}: missing 'role' field")
-                    continue
-
-                role = msg.get("role")
-                if not isinstance(role, str):
-                    log.warning(f"Skipping message at index {msg_idx}: 'role' is not a string")
-                    continue
-
-                content = msg.get("content", "")
-                log.info(f"Processing message {msg_idx} with role: {role}")
-
-                # Process message to get result or options
-                result, options = await _process_message(llm_rails, msg, role, content)
-
-                # If we got options, build messages and generate
-                if options:
-                    check_messages = _build_check_messages(role, content, msg)
-                    gen_result = await llm_rails.generate_async(messages=check_messages, options=options)
-                    # generate_async returns GenerationResponse when options are provided
-                    if isinstance(gen_result, GenerationResponse):
-                        result = gen_result
-                    else:
-                        log.warning(f"Unexpected result type from generate_async: {type(gen_result)}")
-                        continue
-
-                # result should always exist for supported roles
-                if not result:
-                    log.warning(f"No result generated for message {msg_idx} with role {role}")
-                    continue
-
-                # Process result and track activated rails
-                message_rails: dict[str, RailStatus] = {}
-                _process_result_log(result, role, msg, rails_status, message_rails, aggregated_log)
-
-                # Add message result
-                message_results.append(MessageCheckResult(index=msg_idx, role=role, rails=message_rails))
-
-                # Stream intermediate results if requested
-                if body.stream:
-                    intermediate = GuardrailCheckResponse(
-                        status=_calculate_check_status(rails_status),
-                        rails_status=rails_status.copy(),
-                        messages=[],
-                        guardrails_data=None,
-                    )
-                    yield _json_response(intermediate)
-
-            # Build and yield final response
-            final_result = _build_final_response(rails_status, message_results, aggregated_log)
-            yield _json_response(final_result)
-
-        except Exception as e:
-            log.exception(e)
-            yield _json_response(_create_check_error_response("Internal server error.", str(e)))
-
-    if body.stream:
-        return StreamingResponse(process_checks(), media_type="application/x-ndjson")
-    else:
-        # Non-streaming: return only the final result
-        final_result = None
-        async for result in process_checks():
-            final_result = result
-
-        if final_result:
-            return GuardrailCheckResponse.model_validate_json(final_result)
-        else:
-            return _create_check_error_response("No results generated")
+app.include_router(checks_router)
 
 
 # By default, there are no challenges
@@ -1348,3 +772,20 @@ class GuardrailsConfigurationError(Exception):
 #
 #
 # register_exception(app)
+
+
+if not app.disable_chat_ui and mount_chainlit is not None:
+    chainlit_app_path = os.path.join(os.path.dirname(__file__), "app.py")
+    mount_chainlit(app=app, target=chainlit_app_path, path="/chat")
+
+    @app.get("/")
+    async def root_redirect():
+        return RedirectResponse(url="chat")
+
+else:
+    if not app.disable_chat_ui and mount_chainlit is None:
+        log.warning("Chainlit is not installed; chat UI disabled. Install with: pip install nemoguardrails[chat-ui]")
+
+    @app.get("/")
+    async def root_handler():
+        return {"status": "ok"}
