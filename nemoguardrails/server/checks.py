@@ -43,7 +43,7 @@ from nemoguardrails.rails.llm.options import (
 )
 from nemoguardrails.server.api import _get_rails, registered_loggers
 from nemoguardrails.server.schemas.checks import (
-    GuardrailCheckResponse,
+    DetailedGuardrailCheckResponse,
     MessageCheckResult,
     RailStatus,
 )
@@ -280,12 +280,12 @@ def _get_config_ids_from_request(
     return None
 
 
-def _create_check_error_response(error: str, details: Optional[str] = None) -> GuardrailCheckResponse:
+def _create_check_error_response(error: str, details: Optional[str] = None) -> DetailedGuardrailCheckResponse:
     """Create a standardized error response for guardrail checks."""
     guardrails_data = {"error": error}
     if details:
         guardrails_data["details"] = details
-    return GuardrailCheckResponse(status="error", rails_status={}, guardrails_data=guardrails_data)
+    return DetailedGuardrailCheckResponse(status="error", rails_status={}, guardrails_data=guardrails_data)
 
 
 def _create_check_options(
@@ -392,7 +392,7 @@ def _build_final_response(
     rails_status: dict[str, RailStatus],
     message_results: List[MessageCheckResult],
     aggregated_log: GenerationLog,
-) -> GuardrailCheckResponse:
+) -> DetailedGuardrailCheckResponse:
     """Build final guardrail check response."""
     guardrails_data = {
         "log": {
@@ -401,7 +401,7 @@ def _build_final_response(
         }
     }
 
-    return GuardrailCheckResponse(
+    return DetailedGuardrailCheckResponse(
         status=_calculate_check_status(rails_status),
         rails_status=rails_status,
         messages=message_results,
@@ -409,7 +409,7 @@ def _build_final_response(
     )
 
 
-def _json_response(response: GuardrailCheckResponse) -> str:
+def _json_response(response: DetailedGuardrailCheckResponse) -> str:
     """Convert response to JSON string with newline."""
     return json.dumps(response.model_dump()) + "\n"
 
@@ -478,7 +478,7 @@ def _build_check_messages(role: str, content: str, msg: dict) -> List[dict]:
 
 @router.post(
     "/v1/guardrail/checks",
-    response_model=GuardrailCheckResponse,
+    response_model=DetailedGuardrailCheckResponse,
 )
 async def guardrail_checks(body: GuardrailsChatCompletionRequest, request: Request):
     """Check messages against guardrails without generating LLM responses.
@@ -572,7 +572,7 @@ async def guardrail_checks(body: GuardrailsChatCompletionRequest, request: Reque
                 message_results.append(MessageCheckResult(index=msg_idx, role=role, rails=message_rails))
 
                 if body.stream:
-                    intermediate = GuardrailCheckResponse(
+                    intermediate = DetailedGuardrailCheckResponse(
                         status=_calculate_check_status(rails_status),
                         rails_status=rails_status.copy(),
                         messages=[],
@@ -595,6 +595,6 @@ async def guardrail_checks(body: GuardrailsChatCompletionRequest, request: Reque
             final_result = result
 
         if final_result:
-            return GuardrailCheckResponse.model_validate_json(final_result)
+            return DetailedGuardrailCheckResponse.model_validate_json(final_result)
         else:
             return _create_check_error_response("No results generated")
