@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import asyncio
+import contextvars
 import importlib.util
 import json
 import logging
@@ -27,33 +28,39 @@ from typing import Any, AsyncIterator, Callable, List, Optional, Union
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from openai.types.chat.chat_completion import Choice
-from openai.types.chat.chat_completion_message import ChatCompletionMessage
 from pydantic import BaseModel, ValidationError
-from starlette.responses import RedirectResponse, StreamingResponse
+from starlette.responses import JSONResponse, RedirectResponse, StreamingResponse
 
 from nemoguardrails import LLMRails, RailsConfig, utils
 from nemoguardrails.header_forwarding import api_request_headers_var
 from nemoguardrails.rails.llm.config import Model
-from nemoguardrails.rails.llm.options import GenerationOptions, GenerationResponse
+from nemoguardrails.rails.llm.options import GenerationOptions, GenerationResponse, RailStatus
 from nemoguardrails.server.datastore.datastore import DataStore
 from nemoguardrails.server.schemas.openai import (
+    GuardrailCheckRequest,
+    GuardrailCheckResponse,
     GuardrailsChatCompletion,
     GuardrailsChatCompletionRequest,
     OpenAIModelsList,
 )
 from nemoguardrails.server.schemas.utils import (
+    bot_message_to_chat_completion,
     create_error_chat_completion,
     extract_bot_message_from_response,
     fetch_models,
     format_streaming_chunk_as_sse,
     generation_response_to_chat_completion,
+    normalize_tool_calls_openai,
+    resolve_tool_calls,
+    warn_if_thread_history_invalid_for_tool_use,
 )
 
 try:
-    from chainlit.utils import mount_chainlit
+    from chainlit.utils import mount_chainlit as _mount_chainlit
 except ImportError:
-    mount_chainlit = None
+    mount_chainlit: Optional[Callable[..., Any]] = None
+else:
+    mount_chainlit = _mount_chainlit
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -110,6 +117,8 @@ def _validate_public_state_shape(state: Optional[dict]) -> None:
     if not isinstance(state["events"], list):
         _raise_invalid_state("Invalid state format: 'events' must be a list.")
 
+
+api_request_headers: contextvars.ContextVar = contextvars.ContextVar("headers")
 
 api_description = """Guardrails Server API."""
 
@@ -245,6 +254,21 @@ async def get_rails_configs():
 
 
 @app.get(
+    "/v1/health",
+    summary="Liveness health check.",
+    tags=["Health"],
+)
+@app.get(
+    "/healthz",
+    summary="Liveness health check.",
+    tags=["Health"],
+)
+async def health():
+    """Return HTTP 200 while the server process is running and able to serve requests."""
+    return JSONResponse(content={"status": "pass"}, media_type="application/health+json")
+
+
+@app.get(
     "/v1/models",
     response_model=OpenAIModelsList,
     summary="Get list of available models.",
@@ -329,6 +353,20 @@ def _update_models_in_config(config: RailsConfig, main_model: Model) -> RailsCon
     return config.model_copy(update={"models": models})
 
 
+def _inject_model(config: RailsConfig, model_name: str) -> RailsConfig:
+    """Inject the request's model into a RailsConfig using env-based engine/base_url."""
+    engine = os.environ.get("MAIN_MODEL_ENGINE")
+    if not engine:
+        engine = "openai"
+        log.warning("MAIN_MODEL_ENGINE not set, defaulting to 'openai'. ")
+    parameters = {}
+    base_url = os.environ.get("MAIN_MODEL_BASE_URL")
+    if base_url:
+        parameters["base_url"] = base_url
+    main_model = Model(model=model_name, type="main", engine=engine, parameters=parameters)
+    return _update_models_in_config(config, main_model)
+
+
 async def _get_rails(config_ids: List[str], model_name: Optional[str] = None) -> LLMRails:
     """Returns the rails instance for the given config id and model.
 
@@ -374,23 +412,7 @@ async def _get_rails(config_ids: List[str], model_name: Optional[str] = None) ->
         raise ValueError("No valid rails configuration found.")
 
     if model_name:
-        # Get engine from environment or use existing main model's engine
-        existing_main_model = next((m for m in full_llm_rails_config.models if m.type == "main"), None)
-
-        engine = os.environ.get("MAIN_MODEL_ENGINE")
-        if not engine and existing_main_model:
-            engine = existing_main_model.engine
-        elif not engine:
-            engine = "openai"
-            log.warning("No main model in config and MAIN_MODEL_ENGINE not set, defaulting to 'openai'. ")
-
-        parameters = {}
-        base_url = os.environ.get("MAIN_MODEL_BASE_URL")
-        if base_url:
-            parameters["base_url"] = base_url
-
-        main_model = Model(model=model_name, type="main", engine=engine, parameters=parameters)
-        full_llm_rails_config = _update_models_in_config(full_llm_rails_config, main_model)
+        full_llm_rails_config = _inject_model(full_llm_rails_config, model_name)
 
     llm_rails = LLMRails(config=full_llm_rails_config, verbose=True)
     llm_rails_instances[configs_cache_key] = llm_rails
@@ -490,7 +512,9 @@ async def chat_completion(body: GuardrailsChatCompletionRequest, request: Reques
     """
     log.info("Got request for config %s", body.guardrails.config_id)
     for logger in registered_loggers:
-        asyncio.get_event_loop().create_task(logger({"endpoint": "/v1/chat/completions", "body": body.json()}))
+        asyncio.get_event_loop().create_task(
+            logger({"endpoint": "/v1/chat/completions", "body": body.model_dump_json()})
+        )
 
     # Save the request headers in a context variable.
     api_request_headers_var.set(dict(request.headers))
@@ -537,6 +561,17 @@ async def chat_completion(body: GuardrailsChatCompletionRequest, request: Reques
             detail="thread_id message-history replay is not supported for Colang 2.0.",
         )
 
+    if (body.tools or body.tool_choice is not None or body.parallel_tool_calls is not None) and (
+        llm_rails.config.passthrough is not True or body.stream
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "The 'tools', 'tool_choice', and 'parallel_tool_calls' parameters are only "
+                "supported for non-streaming requests when the guardrails configuration has 'passthrough: true'."
+            ),
+        )
+
     try:
         messages = body.messages or []
         if body.guardrails.context:
@@ -560,6 +595,7 @@ async def chat_completion(body: GuardrailsChatCompletionRequest, request: Reques
             # the string `thread-` to all thread keys.
             datastore_key = "thread-" + body.guardrails.thread_id
             thread_messages = json.loads(await datastore.get(datastore_key) or "[]")
+            warn_if_thread_history_invalid_for_tool_use(thread_messages)
 
             # And prepend them.
             messages = thread_messages + messages
@@ -583,6 +619,12 @@ async def chat_completion(body: GuardrailsChatCompletionRequest, request: Reques
             generation_options.llm_params["presence_penalty"] = body.presence_penalty
         if body.frequency_penalty is not None:
             generation_options.llm_params["frequency_penalty"] = body.frequency_penalty
+        if body.tools is not None:
+            generation_options.llm_params["tools"] = body.tools
+        if body.tool_choice is not None:
+            generation_options.llm_params["tool_choice"] = body.tool_choice
+        if body.parallel_tool_calls is not None:
+            generation_options.llm_params["parallel_tool_calls"] = body.parallel_tool_calls
 
         if body.stream:
             # Use stream_async for streaming with output rails support
@@ -609,7 +651,15 @@ async def chat_completion(body: GuardrailsChatCompletionRequest, request: Reques
             # If we're using threads, we also need to update the data before returning
             # the message.
             if body.guardrails.thread_id and datastore is not None and datastore_key is not None:
-                await datastore.set(datastore_key, json.dumps(messages + [bot_message]))
+                # If using tool calls, we need to normalize them to OpenAI format before storing.
+                response_tool_calls = res.tool_calls if isinstance(res, GenerationResponse) else None
+                tool_calls_for_storage = resolve_tool_calls(bot_message, response_tool_calls)
+                if tool_calls_for_storage:
+                    normalized = [tc.model_dump() for tc in normalize_tool_calls_openai(tool_calls_for_storage)]
+                    storable_message = {**bot_message, "tool_calls": normalized}
+                else:
+                    storable_message = bot_message
+                await datastore.set(datastore_key, json.dumps(messages + [storable_message]))
 
             # Build the response with OpenAI-compatible format using utility function
             if isinstance(res, GenerationResponse):
@@ -619,23 +669,10 @@ async def chat_completion(body: GuardrailsChatCompletionRequest, request: Reques
                     config_id=config_ids[0] if config_ids else None,
                 )
             else:
-                # For dict responses, convert to basic chat completion
-                return GuardrailsChatCompletion(
-                    id=f"chatcmpl-{uuid.uuid4()}",
-                    object="chat.completion",
-                    created=int(time.time()),
+                return bot_message_to_chat_completion(
+                    bot_message=bot_message,
                     model=body.model,
-                    choices=[
-                        Choice(
-                            index=0,
-                            message=ChatCompletionMessage(
-                                role="assistant",
-                                content=bot_message.get("content", ""),
-                            ),
-                            finish_reason="stop",
-                            logprobs=None,
-                        )
-                    ],
+                    config_id=config_ids[0] if config_ids else None,
                 )
 
     except HTTPException:
@@ -647,6 +684,79 @@ async def chat_completion(body: GuardrailsChatCompletionRequest, request: Reques
             error_message="Internal server error",
             config_id=config_ids[0] if config_ids else None,
         )
+
+
+def _map_rail_status(status: RailStatus) -> str:
+    """Map internal RailStatus to API status string."""
+    return status.value
+
+
+@app.post(
+    "/v1/checks",
+    response_model=GuardrailCheckResponse,
+    response_model_exclude_none=True,
+)
+async def guardrail_check(body: GuardrailCheckRequest, request: Request):
+    """Guardrail check request."""
+    api_request_headers.set(request.headers)
+
+    if not body.messages:
+        raise HTTPException(status_code=422, detail="messages must be non-empty")
+
+    config_ids = None
+    config = body.guardrails.config
+
+    if isinstance(config, dict):
+        try:
+            rails_config = RailsConfig.from_content(config=config)
+            if body.model:
+                rails_config = _inject_model(rails_config, body.model)
+            llm_rails = LLMRails(config=rails_config, verbose=True)
+        except Exception as ex:
+            log.exception(ex)
+            raise HTTPException(status_code=422, detail=f"Invalid inline config: {ex}")
+    else:
+        if isinstance(config, str):
+            config_ids = [config]
+        elif body.guardrails.config_ids:
+            config_ids = list(body.guardrails.config_ids)
+        elif app.default_config_id:
+            config_ids = [app.default_config_id]
+        else:
+            raise HTTPException(
+                status_code=422,
+                detail="No guardrails config_id provided and server has no default configuration",
+            )
+        try:
+            llm_rails = await _get_rails(config_ids, model_name=body.model)
+        except ValueError as ex:
+            log.exception(ex)
+            raise HTTPException(status_code=422, detail=str(ex))
+
+    if llm_rails.config.colang_version != "1.0":
+        raise HTTPException(
+            status_code=422,
+            detail="check_async does not support Colang 2.0 configurations.",
+        )
+
+    try:
+        messages = list(body.messages)
+        if body.guardrails.context:
+            messages.insert(0, {"role": "context", "content": body.guardrails.context})
+
+        result = await llm_rails.check_async(messages=messages)
+
+        return GuardrailCheckResponse(
+            status=_map_rail_status(result.status),
+            content=result.content,
+            rail=result.rail,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as ex:
+        log.exception(ex)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # Include fork-specific checks endpoint router

@@ -37,7 +37,7 @@ class MessageCheckResult(BaseModel):
     )
 
 
-class GuardrailCheckResponse(BaseModel):
+class DetailedGuardrailCheckResponse(BaseModel):
     """Response body for the /v1/guardrail/checks endpoint."""
 
     status: str = Field(

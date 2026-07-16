@@ -122,6 +122,7 @@ class DefaultFramework:
         # to suppress Authorization: Bearer without falling back to the env-var
         # resolver. A missing key still resolves through _resolve_api_key.
         api_key = kwargs.pop("api_key", _UNSET)
+        kwargs.pop("openai_api_key", None)
         if api_key is _UNSET:
             api_key = _resolve_api_key(provider_name)
 
