@@ -15,7 +15,7 @@ RUN dnf install -y --nodocs --setopt=install_weak_deps=False \
     dnf clean all && \
     rm -rf /var/cache/dnf /tmp/* /var/tmp/*
 
-COPY requirements.txt pyproject.toml README.md ./
+COPY requirements.txt pyproject.toml README.md LICENSE.md LICENSE-Apache-2.0.txt LICENCES-3rd-party ./
 COPY nemoguardrails/ ./nemoguardrails/
 COPY scripts/ ./scripts/
 COPY examples/bots/ ./examples/bots/
@@ -34,8 +34,10 @@ RUN python3 -m venv /app/.venv && \
     /app/.venv/bin/pip install --no-cache-dir \
         --extra-index-url https://download.pytorch.org/whl/cpu \
         -r requirements.txt && \
+    mkdir -p nemoguardrails/examples && \
+    cp -r examples/bots nemoguardrails/examples/bots && \
     /app/.venv/bin/pip install --no-cache-dir --no-deps . && \
-    rm -rf /root/.cache/pip /tmp/* /var/tmp/*
+    rm -rf nemoguardrails/examples /root/.cache/pip /tmp/* /var/tmp/*
 
 # Pre-download required models and cleanup
 RUN set -ex && \

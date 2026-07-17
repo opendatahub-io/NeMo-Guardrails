@@ -323,9 +323,13 @@ class LLMRails(BaseGuardrails):
             self.config.flows.extend(default_flows)
 
             # We also need to load the content from the components library.
+            # Sort entries so the traversal order is filesystem-independent;
+            # otherwise the order in which library bot_messages are inserted
+            # (and which definition wins on collisions) varies between platforms.
             library_path = os.path.join(os.path.dirname(__file__), "../../library")
             for root, dirs, files in os.walk(library_path):
-                for file in files:
+                dirs.sort()
+                for file in sorted(files):
                     # Extract the full path for the file
                     full_path = os.path.join(root, file)
                     if file.endswith(".co"):
@@ -921,7 +925,7 @@ class LLMRails(BaseGuardrails):
                     "Invalid Colang 1.0 state format: state must contain an 'events' key. "
                     "Use an empty dict {} to start a new conversation."
                 )
-            if not isinstance(state["events"], list):
+            if not isinstance(state["events"], list):  # ty: ignore[invalid-argument-type]
                 raise InvalidStateError("Invalid Colang 1.0 state format: 'events' must be a list.")
             return
 
@@ -1029,10 +1033,18 @@ class LLMRails(BaseGuardrails):
 
         # If the last message is from the assistant, rather than the user, then
         # we move that to the `$bot_message` variable. This is to enable a more
-        # convenient interface. (only when dialog rails are disabled)
-        if messages and messages[-1]["role"] == "assistant" and gen_options and gen_options.rails.dialog is False:
+        # convenient interface for text output rails. Tool-call assistant messages
+        # must remain in the history so they can be converted into BotToolCalls
+        # events and evaluated by tool output rails.
+        if (
+            messages
+            and messages[-1]["role"] == "assistant"
+            and not messages[-1].get("tool_calls")
+            and gen_options
+            and gen_options.rails.dialog is False
+        ):
             # We already have the first message with a context update, so we use that
-            messages[0]["content"]["bot_message"] = messages[-1]["content"]
+            messages[0]["content"]["bot_message"] = messages[-1]["content"]  # ty: ignore[invalid-assignment]
             messages = messages[0:-1]
 
         # TODO: Add support to load back history of events, next to history of messages
@@ -1053,7 +1065,7 @@ class LLMRails(BaseGuardrails):
             state_events = []
             if state:
                 assert isinstance(state, dict)
-                state_events = state["events"]
+                state_events = state["events"]  # ty: ignore[invalid-argument-type]
 
             new_events = []
             # Compute the new events.
@@ -1071,7 +1083,7 @@ class LLMRails(BaseGuardrails):
                     error_payload: str = json.dumps(error_dict)
                     await streaming_handler.push_chunk(error_payload)
                     # push a termination signal
-                    await streaming_handler.push_chunk(END_OF_STREAM)  # type: ignore
+                    await streaming_handler.push_chunk(END_OF_STREAM)
                 # Re-raise the exact exception
                 raise
         else:
@@ -1180,7 +1192,7 @@ class LLMRails(BaseGuardrails):
         streaming_handler = streaming_handler_var.get()
         if streaming_handler:
             # print("Closing the stream handler explicitly")
-            await streaming_handler.push_chunk(END_OF_STREAM)  # type: ignore
+            await streaming_handler.push_chunk(END_OF_STREAM)
 
         # IF tracing is enabled we need to set GenerationLog attrs
         original_log_options = None
@@ -1209,8 +1221,9 @@ class LLMRails(BaseGuardrails):
         # If we have generation options, we prepare a GenerationResponse instance.
         if gen_options:
             # If a prompt was used, we only need to return the content of the message.
-            if prompt:
-                res = GenerationResponse(response=new_message["content"])
+            message_content = new_message["content"]
+            if prompt and isinstance(message_content, str):
+                res = GenerationResponse(response=message_content)
             else:
                 res = GenerationResponse(response=[new_message])
 
@@ -1338,9 +1351,10 @@ class LLMRails(BaseGuardrails):
         else:
             # If a prompt is used, we only return the content of the message.
 
-            if reasoning_content:
+            message_content = new_message["content"]
+            if reasoning_content and isinstance(message_content, str):
                 thinking_trace = f"<think>{reasoning_content}</think>\n"
-                new_message["content"] = thinking_trace + new_message["content"]
+                new_message["content"] = thinking_trace + message_content
 
             if prompt:
                 return new_message["content"]
@@ -1441,7 +1455,7 @@ class LLMRails(BaseGuardrails):
                 error_dict = extract_error_json(error_message)
                 error_payload = json.dumps(error_dict)
                 await streaming_handler.push_chunk(error_payload)
-                await streaming_handler.push_chunk(END_OF_STREAM)  # type: ignore
+                await streaming_handler.push_chunk(END_OF_STREAM)
 
         task = asyncio.create_task(_generation_task())
 
@@ -1819,13 +1833,13 @@ class LLMRails(BaseGuardrails):
 
         def _get_latest_user_message(
             messages: Optional[List[dict]] = None,
-        ) -> dict:
+        ) -> str:
             if messages is None:
-                return {}
+                return ""
             for message in reversed(messages):
                 if message.get("role") == "user":
-                    return message
-            return {}
+                    return message.get("content", "")
+            return ""
 
         def _prepare_context_for_parallel_rails(
             chunk_str: str,
@@ -1874,14 +1888,15 @@ class LLMRails(BaseGuardrails):
 
             model_name = flow_id.split("$")[-1].split("=")[-1].strip('"')
 
-            # we pass action params that are defined in the flow
-            # caveate, e.g. prmpt_security uses bot_response=$bot_message
-            # to resolve replace placeholders in action_params
-            for key, value in action_params.items():
+            # Resolve $bot_message / $user_message into a new dict. action_params
+            # is the shared flow config (reused across chunks and requests) and
+            # must not be mutated in place.
+            resolved_params = dict(action_params or {})
+            for key, value in resolved_params.items():
                 if value == "$bot_message":
-                    action_params[key] = bot_response_chunk
+                    resolved_params[key] = bot_response_chunk
                 elif value == "$user_message":
-                    action_params[key] = user_message
+                    resolved_params[key] = user_message
 
             return {
                 # TODO:: are there other context variables that need to be passed?
@@ -1893,7 +1908,7 @@ class LLMRails(BaseGuardrails):
                 "model_name": model_name,
                 "llms": self.runtime.registered_action_params.get("llms", {}),
                 "llm": self.runtime.registered_action_params.get(f"{action_name}_llm", self.llm),
-                **action_params,
+                **resolved_params,
             }
 
         buffer_strategy = get_buffer_strategy(output_rails_streaming_config)
@@ -2012,8 +2027,26 @@ class LLMRails(BaseGuardrails):
                         action_params=action_params,
                     )
 
-                    result = await self.runtime.action_dispatcher.execute_action(action_name, params)
+                    try:
+                        result, status = await self.runtime.action_dispatcher.execute_action(action_name, params)
+                    except Exception:
+                        log.exception("Action %s failed during sequential streaming", action_name)
+                        result, status = None, "failed"
                     self._explain_info = self._ensure_explain_info()
+
+                    if status != "success":
+                        error_message = f"Action {action_name} failed with status: {status}"
+                        log.error(error_message)
+                        error_data = {
+                            "error": {
+                                "message": f"Internal error in {flow_id} rail: {error_message}",
+                                "type": "internal_error",
+                                "param": flow_id,
+                                "code": "rail_execution_failure",
+                            }
+                        }
+                        yield json.dumps(error_data)
+                        return
 
                     action_func = self.runtime.action_dispatcher.get_action(action_name)
 

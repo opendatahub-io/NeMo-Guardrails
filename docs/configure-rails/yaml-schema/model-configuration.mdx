@@ -69,9 +69,9 @@ models:
 
 ## Configuration Examples
 
-### OpenAI
+### OpenAI Chat Completions
 
-The following example shows how to configure the OpenAI model as the main application LLM:
+The following example shows how to configure the OpenAI model as the main application LLM using the chat completions endpoint:
 
 ```yaml
 models:
@@ -79,6 +79,46 @@ models:
     engine: openai
     model: gpt-4o
 ```
+
+### OpenAI Responses API
+
+Use the [OpenAI Responses API](https://platform.openai.com/docs/api-reference/responses) (`/v1/responses`) when an OpenAI model or option requires it. For example, some models, such as `gpt-5-pro`, require the Responses API, and recent OpenAI models support options such as `reasoning_effort` through the Responses API.
+
+The NVIDIA NeMo Guardrails library supports this option through the LangChain framework. Set `NEMOGUARDRAILS_LLM_FRAMEWORK=langchain`, install `langchain-openai`, and set `use_responses_api: true` in the model's `parameters` block:
+
+```yaml
+models:
+  - type: main
+    engine: openai
+    model: gpt-4o
+    parameters:
+      use_responses_api: true
+```
+
+<Note>
+
+The built-in default framework does not support the Responses API. It calls `/v1/chat/completions` and forwards `use_responses_api` as an unknown request field, so the flag has no effect. For background, refer to [Migrating to 0.22](/reference/0-22#using-langchain).
+
+</Note>
+
+Function tool calls work over the Responses API in streaming and non-streaming modes. The adapter surfaces function calls on `LLMResponse.tool_calls` and `LLMResponseChunk.delta_tool_calls`, and reports `finish_reason` as `tool_calls`.
+
+Built-in Responses API tools, such as `web_search`, `file_search`, `code_interpreter`, and `computer_use`, are not surfaced as tool calls. The API returns those tools as response output items, not function calls, so only function-tool passthrough is supported.
+
+Self-hosted servers that expose an OpenAI-compatible `/v1/responses` endpoint, such as vLLM, work with the same flag plus `parameters.base_url`. Confirm that your server implements `/v1/responses` before you enable the flag. Models that use the [Harmony response format](https://github.com/openai/harmony), such as `gpt-oss` or `gpt-oss-safeguard`, should use the Responses API.
+
+```yaml
+models:
+  - type: main
+    engine: openai
+    model: openai/gpt-oss-120b
+    api_key_env_var: THIS_CAN_BE_ANY_KEY
+    parameters:
+      base_url: http://localhost:8000/v1
+      use_responses_api: true
+```
+
+A complete example is available in [`examples/configs/llm/openai-responses-api`](https://github.com/NVIDIA-NeMo/Guardrails/tree/develop/examples/configs/llm/openai-responses-api).
 
 ### Azure OpenAI
 
