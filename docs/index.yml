@@ -32,6 +32,9 @@ navigation:
       - page: Installation
         path: getting-started/installation-guide.mdx
         slug: installation-guide
+      - page: Use with AI Agents
+        path: getting-started/use-with-ai-agent.mdx
+        slug: use-with-ai-agent
       - section: Tutorials
         path: getting-started/tutorials/index.mdx
         slug: tutorials
@@ -118,6 +121,9 @@ navigation:
           - page: Agentic Security
             path: configure-rails/guardrail-catalog/agentic-security.mdx
             slug: agentic-security
+          - page: Tool Calling
+            path: configure-rails/guardrail-catalog/tool-calling.mdx
+            slug: tool-calling
           - page: Hallucinations & Fact-Checking
             path: configure-rails/guardrail-catalog/fact-checking.mdx
             slug: fact-checking
@@ -176,6 +182,9 @@ navigation:
               - page: PolicyAI
                 path: configure-rails/guardrail-catalog/community/policyai.mdx
                 slug: policyai
+              - page: Polygraf
+                path: configure-rails/guardrail-catalog/community/polygraf.mdx
+                slug: polygraf
               - page: Presidio
                 path: configure-rails/guardrail-catalog/community/presidio.mdx
                 slug: presidio
@@ -488,6 +497,12 @@ navigation:
           - page: OpenTelemetry Logs
             path: observability/tracing/opentelemetry-logs.mdx
             slug: opentelemetry-logs
+          - page: Span Reference
+            path: observability/tracing/span-reference.mdx
+            slug: span-reference
+          - page: Content Capture
+            path: observability/tracing/content-capture.mdx
+            slug: content-capture
           - page: Troubleshooting
             path: observability/tracing/troubleshooting.mdx
             slug: troubleshooting
@@ -559,6 +574,9 @@ navigation:
       - page: Use Case Diagrams
         path: reference/use-case-diagrams.mdx
         slug: use-case-diagrams
+      - page: Engine Feature Support
+        path: reference/engine-feature-support.mdx
+        slug: engine-feature-support
       - folder: _static/python-sdk-reference/guardrails-python-sdk
         title: Python SDK Reference
         collapsed: true
@@ -584,6 +602,12 @@ navigation:
                 title: List Challenges
                 slug: list-challenges
           - health:
+              - endpoint: GET /v1/health
+                title: Health Check
+                slug: get-health
+              - endpoint: GET /healthz
+                title: Health Check (Alias)
+                slug: get-healthz
               - endpoint: GET /
                 title: Get Server Health or Chat UI
                 slug: get-root
