@@ -161,7 +161,7 @@ ENV PATH="$HOME/.cargo/bin:/app/.venv/bin:$PATH"
 ENV BLIS_ARCH=generic
 ENV GRPC_PYTHON_BUILD_SYSTEM_OPENSSL=1
 
-COPY requirements.txt requirements-torch.txt pyproject.toml README.md ./
+COPY requirements.txt requirements-torch.txt pyproject.toml README.md LICENSE* LICENCES* ./
 COPY nemoguardrails/ ./nemoguardrails/
 COPY scripts/ ./scripts/
 COPY examples/bots/ ./examples/bots/
