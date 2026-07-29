@@ -272,7 +272,7 @@ packaging==25.0
     #   weasel
 phonenumbers==9.0.10
     # via presidio-analyzer
-pillow==11.3.0
+pillow==12.1.1
     # via
     #   fastembed
     #   sentence-transformers
