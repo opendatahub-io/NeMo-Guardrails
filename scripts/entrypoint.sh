@@ -19,8 +19,8 @@ CONFIG_DIR="/app/config/${CONFIG_ID}"
 echo "🚀 Starting NeMo Guardrails with config from: $CONFIG_DIR (port: $PORT)"
 
 # Validate config exists
-if [[ ! -f "$CONFIG_DIR/config.yaml" ]]; then
-  echo "❌ ERROR: config.yaml not found in $CONFIG_DIR"
+if ! compgen -G "$CONFIG_DIR/config.y{a,}ml" > /dev/null; then
+  echo "❌ ERROR: config.yaml (or config.yml) not found in $CONFIG_DIR"
   exit 1
 fi
 
