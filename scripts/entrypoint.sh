@@ -25,8 +25,7 @@ if [[ ! -f "$CONFIG_DIR/config.yaml" ]]; then
 fi
 
 if [[ ! -f "$CONFIG_DIR/rails.co" ]]; then
-  echo "❌ ERROR: rails.co not found in $CONFIG_DIR (ConfigMap is read-only, please provide it)"
-  exit 1
+  echo "⚠️  WARNING: rails.co not found in $CONFIG_DIR. If your config requires custom Colang flows, make sure to provide it."
 fi
 
 echo "✅ Configuration validated. Starting server..."
