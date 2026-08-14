@@ -19,14 +19,13 @@ CONFIG_DIR="/app/config/${CONFIG_ID}"
 echo "🚀 Starting NeMo Guardrails with config from: $CONFIG_DIR (port: $PORT)"
 
 # Validate config exists
-if [[ ! -f "$CONFIG_DIR/config.yaml" ]]; then
-  echo "❌ ERROR: config.yaml not found in $CONFIG_DIR"
+if ! compgen -G "$CONFIG_DIR/config.y{a,}ml" > /dev/null; then
+  echo "❌ ERROR: config.yaml (or config.yml) not found in $CONFIG_DIR"
   exit 1
 fi
 
 if [[ ! -f "$CONFIG_DIR/rails.co" ]]; then
-  echo "❌ ERROR: rails.co not found in $CONFIG_DIR (ConfigMap is read-only, please provide it)"
-  exit 1
+  echo "⚠️  WARNING: rails.co not found in $CONFIG_DIR. If your config requires custom Colang flows, make sure to provide it."
 fi
 
 echo "✅ Configuration validated. Starting server..."
