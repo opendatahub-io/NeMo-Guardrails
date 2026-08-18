@@ -37,7 +37,7 @@ provider-integration specifics that matter when editing this package.
   bodies. Secrets belong in headers, environment variables, or local
   configuration paths.
 - Route LLM calls through existing framework/model abstractions and helpers such
-  as `nemoguardrails.actions.llm.utils.llm_call` unless the surrounding code
+  as `nemoguardrails.llm.call.llm_call` unless the surrounding code
   already establishes a more specific path. Avoid ad hoc provider calls that
   bypass shared parameter handling, tracing, metrics, or streaming behavior.
 - For OpenAI-compatible providers, prefer the built-in default framework and
@@ -49,9 +49,12 @@ provider-integration specifics that matter when editing this package.
 - Avoid broad filesystem walks, import-time side effects, and global state
   changes in runtime paths unless the surrounding code already establishes that
   pattern.
-- Wrap provider/LLM failures in the domain exceptions in
-  `nemoguardrails/exceptions.py` (`LLMCallException`, `LLMClientError`
-  subclasses) and re-raise with `from`; do not raise bare exceptions.
+- Wrap failures from LLM model and LLM-provider calls in the domain exceptions
+  in `nemoguardrails/exceptions.py` (`LLMCallException` and `LLMClientError`
+  subclasses), preserving the original cause with `from`. Do not use the
+  `LLM*` exception hierarchy for non-LLM integrations such as external
+  guardrail, moderation, or scanning APIs unless their established contract
+  explicitly requires it.
 - Use a module-level `log = logging.getLogger(__name__)`; never `print`.
 - Sync public methods delegate to their `_async` twin via
   `get_or_create_event_loop()` and must raise if called inside a running loop;

@@ -18,11 +18,11 @@ import warnings
 from collections.abc import Collection
 from typing import Any, Dict, List, Optional
 
-from nemoguardrails.actions.llm.utils import llm_call, warn_if_truncated
-from nemoguardrails.colang.v1_0.runtime.flows import _get_flow_params, _normalize_flow_id
 from nemoguardrails.context import llm_call_info_var
+from nemoguardrails.llm.call import llm_call, warn_if_truncated
 from nemoguardrails.logging.explain import LLMCallInfo
 from nemoguardrails.types import LLMModel
+from nemoguardrails.utils import _get_flow_params, _normalize_flow_id
 
 log = logging.getLogger(__name__)
 
@@ -66,7 +66,7 @@ def get_self_check_prompt_task(
 
 
 def resolve_self_check_task(
-    task: Optional[str],
+    variant: Optional[str],
     context: Optional[dict],
     events: Optional[List[dict]],
     triggered_rail_key: str,
@@ -75,8 +75,8 @@ def resolve_self_check_task(
     variant_param: str,
     default_task: str,
 ) -> str:
-    if task and not task.startswith("$"):
-        return task
+    if variant and not variant.startswith("$"):
+        return variant
 
     context = context or {}
     context_task = get_self_check_task_from_rail(
