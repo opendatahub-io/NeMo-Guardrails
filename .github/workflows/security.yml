@@ -37,7 +37,7 @@ jobs:
           version: "0.11.26"
 
       - name: Install dependencies
-        run: uv sync --locked --all-extras --group dev
+        run: uv lock --upgrade && uv sync --all-extras --group dev
 
       - name: Run Trivy filesystem scan
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
@@ -108,7 +108,7 @@ jobs:
           version: "0.11.26"
 
       - name: Install dependencies
-        run: uv sync --locked --all-extras --group dev
+        run: uv lock --upgrade && uv sync --all-extras --group dev
 
       - name: Install Bandit
         run: uv run pip install bandit[sarif]
