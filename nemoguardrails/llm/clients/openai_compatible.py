@@ -56,8 +56,9 @@ class OpenAICompatibleClient(BaseClient):
         stop: Optional[List[str]] = None,
         **kwargs: Any,
     ) -> HTTPResponse:
+        extra_headers = kwargs.pop("extra_headers", None)
         payload = self._build_payload(model, messages, stop=stop, **kwargs)
-        return await self._apost(self._ROUTE, payload)
+        return await self._apost(self._ROUTE, payload, extra_headers=extra_headers)
 
     async def stream_chat_completion(
         self,
@@ -67,8 +68,9 @@ class OpenAICompatibleClient(BaseClient):
         stop: Optional[List[str]] = None,
         **kwargs: Any,
     ) -> AsyncGenerator[HTTPResponse, None]:
+        extra_headers = kwargs.pop("extra_headers", None)
         payload = self._build_payload(model, messages, stop=stop, stream=True, **kwargs)
-        gen = self._apost_stream(self._ROUTE, payload)
+        gen = self._apost_stream(self._ROUTE, payload, extra_headers=extra_headers)
         try:
             async for chunk in gen:
                 yield chunk

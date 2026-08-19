@@ -184,17 +184,26 @@ class BaseClient:
         log.info("Retrying (delay=%.1fs, attempted=%d)", delay, retries_attempted)
         await asyncio.sleep(delay)
 
-    async def _apost(self, path: str, payload: Dict[str, Any]) -> HTTPResponse:
+    async def _apost(
+        self,
+        path: str,
+        payload: Dict[str, Any],
+        *,
+        extra_headers: Optional[Dict[str, str]] = None,
+    ) -> HTTPResponse:
         retries_remaining = self._max_retries
         retries_attempted = 0
         ctx = self._error_context()
 
         while True:
+            headers = self._build_headers()
+            if extra_headers:
+                headers.update(extra_headers)
             try:
                 response = await self._client.post(
                     f"{self._base_url}{path}",
                     json=payload,
-                    headers=self._build_headers(),
+                    headers=headers,
                     params=self._custom_query or None,
                 )
             except httpx.TimeoutException as err:
@@ -241,19 +250,28 @@ class BaseClient:
                 ) from err
             return HTTPResponse(body=data, headers=dict(response.headers), status_code=response.status_code)
 
-    async def _apost_stream(self, path: str, payload: Dict[str, Any]) -> AsyncGenerator[HTTPResponse, None]:
+    async def _apost_stream(
+        self,
+        path: str,
+        payload: Dict[str, Any],
+        *,
+        extra_headers: Optional[Dict[str, str]] = None,
+    ) -> AsyncGenerator[HTTPResponse, None]:
         retries_remaining = self._max_retries
         retries_attempted = 0
         ctx = self._error_context()
 
         while True:
+            headers = self._build_headers()
+            if extra_headers:
+                headers.update(extra_headers)
             first_yielded = False
             try:
                 async with self._client.stream(
                     "POST",
                     f"{self._base_url}{path}",
                     json=payload,
-                    headers=self._build_headers(),
+                    headers=headers,
                     params=self._custom_query or None,
                 ) as response:
                     if self._should_retry(response.status_code, response.headers) and retries_remaining > 0:
