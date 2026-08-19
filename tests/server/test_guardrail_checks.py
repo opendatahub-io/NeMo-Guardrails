@@ -20,7 +20,8 @@ import pytest
 pytest.importorskip("openai", reason="openai is required for server tests")
 from fastapi.testclient import TestClient
 
-from nemoguardrails.rails.llm.options import RailsResult, RailStatus
+from nemoguardrails.exceptions import RailTypeNotConfiguredError
+from nemoguardrails.rails.llm.options import RailsResult, RailStatus, RailType
 from nemoguardrails.server import api
 
 client = TestClient(api.app)
@@ -130,44 +131,6 @@ def test_config_id_resolves():
     mock_get.assert_called_once_with(["my_config"], model_name="test")
 
 
-def test_config_string_resolves_via_get_rails():
-    result = RailsResult(status=RailStatus.PASSED, content="hi")
-    mock = _mock_rails(result)
-
-    with patch.object(api, "_get_rails", new_callable=AsyncMock, return_value=mock) as mock_get:
-        resp = _post(
-            {
-                "model": "test",
-                "messages": [{"role": "user", "content": "hi"}],
-                "guardrails": {"config": "my_config"},
-            }
-        )
-
-    assert resp.status_code == 200
-    mock_get.assert_called_once_with(["my_config"], model_name="test")
-
-
-def test_inline_config():
-    result = RailsResult(status=RailStatus.PASSED, content="hi")
-    mock_llm_rails = _mock_rails(result)
-
-    with (
-        patch("nemoguardrails.server.api.RailsConfig") as mock_config_cls,
-        patch("nemoguardrails.server.api.LLMRails", return_value=mock_llm_rails),
-    ):
-        mock_config_cls.from_content.return_value = MagicMock()
-        resp = _post(
-            {
-                "model": "test",
-                "messages": [{"role": "user", "content": "hi"}],
-                "guardrails": {"config": {"models": [], "rails": {}}},
-            }
-        )
-
-    assert resp.status_code == 200
-    mock_config_cls.from_content.assert_called_once()
-
-
 def test_default_config_used_when_none_specified():
     api.app.default_config_id = "my_default"
     result = RailsResult(status=RailStatus.PASSED, content="hi")
@@ -199,17 +162,6 @@ def test_empty_messages_returns_422():
     assert resp.status_code == 422
 
 
-def test_config_and_config_id_mutually_exclusive():
-    resp = _post(
-        {
-            "model": "test",
-            "messages": [{"role": "user", "content": "hi"}],
-            "guardrails": {"config": "a", "config_id": "b"},
-        }
-    )
-    assert resp.status_code == 422
-
-
 def test_no_config_no_default_returns_422():
     api.app.default_config_id = None
     resp = _post(
@@ -219,7 +171,7 @@ def test_no_config_no_default_returns_422():
         }
     )
     assert resp.status_code == 422
-    assert "config" in resp.json()["detail"].lower()
+    assert "config" in resp.json()["error"]["message"].lower()
 
 
 # --- Colang 2.0 rejection ---
@@ -239,7 +191,7 @@ def test_colang_v2_returns_422():
         )
 
     assert resp.status_code == 422
-    assert "colang 2.0" in resp.json()["detail"].lower()
+    assert "colang 2.0" in resp.json()["error"]["message"].lower()
 
 
 # --- Error handling ---
@@ -296,3 +248,68 @@ def test_context_prepended_to_messages():
     messages = call_args.kwargs.get("messages") or call_args[0][0]
     assert messages[0]["role"] == "context"
     assert messages[0]["content"] == {"topic": "science"}
+
+
+@pytest.mark.parametrize(
+    "rail_types_input, expected",
+    [
+        (["input"], [RailType.INPUT]),
+        (["output"], [RailType.OUTPUT]),
+        (["input", "output"], [RailType.INPUT, RailType.OUTPUT]),
+        (None, None),
+    ],
+)
+def test_rail_types_passed_through(rail_types_input, expected):
+    result = RailsResult(status=RailStatus.PASSED, content="hi")
+    mock = _mock_rails(result)
+
+    guardrails = {"config_id": "test"}
+    if rail_types_input is not None:
+        guardrails["rail_types"] = rail_types_input
+
+    with patch.object(api, "_get_rails", new_callable=AsyncMock, return_value=mock):
+        resp = _post(
+            {
+                "model": "test",
+                "messages": [{"role": "user", "content": "hi"}],
+                "guardrails": guardrails,
+            }
+        )
+
+    assert resp.status_code == 200
+    mock.check_async.assert_called_once()
+    assert mock.check_async.call_args.kwargs["rail_types"] == expected
+
+
+def test_rail_types_invalid_value_returns_422():
+    resp = _post(
+        {
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "guardrails": {"config_id": "test", "rail_types": ["invalid"]},
+        }
+    )
+    assert resp.status_code == 422
+
+
+# --- Unsatisfiable rail_types ---
+
+
+def test_unsatisfiable_rail_types_returns_422():
+    result = RailsResult(status=RailStatus.PASSED, content="hi")
+    mock = _mock_rails(result)
+    mock.check_async = AsyncMock(
+        side_effect=RailTypeNotConfiguredError("Requested rail type 'output' has no configured rails.")
+    )
+
+    with patch.object(api, "_get_rails", new_callable=AsyncMock, return_value=mock):
+        resp = _post(
+            {
+                "model": "test",
+                "messages": [{"role": "user", "content": "hi"}],
+                "guardrails": {"config_id": "test", "rail_types": ["output"]},
+            }
+        )
+
+    assert resp.status_code == 422
+    assert "output" in resp.json()["error"]["message"]

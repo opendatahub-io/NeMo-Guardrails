@@ -18,6 +18,7 @@ from typing import Dict, List, Optional
 
 from nemoguardrails import RailsConfig
 from nemoguardrails.actions import action
+from nemoguardrails.actions.rail_outcome import RailOutcome
 from nemoguardrails.library.self_check.utils import (
     SELF_CHECK_OUTPUT_DEFAULT_TASK,
     SELF_CHECK_OUTPUT_FLOW,
@@ -33,7 +34,11 @@ log = logging.getLogger(__name__)
 DEFAULT_TASK = SELF_CHECK_OUTPUT_DEFAULT_TASK
 
 
-@action(is_system_action=True, output_mapping=lambda value: not value)
+def _self_check_outcome(allowed: bool) -> RailOutcome:
+    return RailOutcome.allow() if allowed else RailOutcome.block()
+
+
+@action(is_system_action=True)
 async def self_check_output(
     llms: Dict[str, LLMModel],
     llm_task_manager: LLMTaskManager,
@@ -41,9 +46,9 @@ async def self_check_output(
     events: Optional[List[dict]] = None,
     llm: Optional[LLMModel] = None,
     config: Optional[RailsConfig] = None,
-    task: Optional[str] = None,
+    variant: Optional[str] = None,
     **kwargs,
-):
+) -> RailOutcome:
     """Checks if the output from the bot.
 
     Prompt the LLM, using the `self_check_output` task prompt, to determine if the output
@@ -53,7 +58,7 @@ async def self_check_output(
     (this is consistent with self_check_input_prompt).
 
     Returns:
-        True if the output should be allowed, False otherwise.
+        RailOutcome.allow() if the output should be allowed, RailOutcome.block() otherwise.
     """
 
     context = context or {}
@@ -62,7 +67,7 @@ async def self_check_output(
     bot_thinking = context.get("bot_thinking")
 
     task = resolve_self_check_task(
-        task,
+        variant,
         context,
         events,
         triggered_rail_key="triggered_output_rail",
@@ -72,24 +77,26 @@ async def self_check_output(
         default_task=DEFAULT_TASK,
     )
 
-    if bot_response:
-        is_safe, response = await run_self_check_task(
-            task=task,
-            prompt_context={
-                "user_input": user_input,
-                "bot_response": bot_response,
-                "bot_thinking": bot_thinking,
-            },
-            llms=llms,
-            default_task=DEFAULT_TASK,
-            main_llm=llm,
-            llm_task_manager=llm_task_manager,
-            lowest_temperature=config.lowest_temperature,
-        )
+    if not bot_response:
+        return _self_check_outcome(False)
 
-        if task == DEFAULT_TASK:
-            log.info(f"Output self-checking result is: `{response}`.")
-        else:
-            log.info(f"Output self-checking result for task={task} is: `{response}`.")
+    is_safe, response = await run_self_check_task(
+        task=task,
+        prompt_context={
+            "user_input": user_input,
+            "bot_response": bot_response,
+            "bot_thinking": bot_thinking,
+        },
+        llms=llms,
+        default_task=DEFAULT_TASK,
+        main_llm=llm,
+        llm_task_manager=llm_task_manager,
+        lowest_temperature=config.lowest_temperature if config is not None else 0.0,
+    )
 
-        return is_safe
+    if task == DEFAULT_TASK:
+        log.info(f"Output self-checking result is: `{response}`.")
+    else:
+        log.info(f"Output self-checking result for task={task} is: `{response}`.")
+
+    return _self_check_outcome(is_safe)

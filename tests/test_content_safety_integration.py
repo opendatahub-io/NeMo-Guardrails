@@ -25,6 +25,8 @@ from unittest.mock import MagicMock
 import pytest
 
 from nemoguardrails import RailsConfig
+from nemoguardrails.actions.rail_outcome import RailOutcome
+from nemoguardrails.guardrails.compiled_rail import RailDependencies, compile_rail
 from nemoguardrails.library.content_safety.actions import (
     content_safety_check_input,
     content_safety_check_output,
@@ -36,6 +38,7 @@ from nemoguardrails.llm.output_parsers import (
     nemotron_reasoning_parse_prompt_safety,
     nemotron_reasoning_parse_response_safety,
 )
+from nemoguardrails.manifests import RailDirection
 from tests.utils import FakeLLMModel, TestChat
 
 
@@ -89,8 +92,8 @@ class TestContentSafetyParserIntegration:
             context=context,
         )
 
-        assert result["allowed"] is expected_allowed
-        assert result["policy_violations"] == expected_violations
+        assert result.is_blocked == (not expected_allowed)
+        assert result.metadata["policy_violations"] == expected_violations
 
     @pytest.mark.asyncio
     async def test_content_safety_input_with_is_content_safe_parser_safe_with_violations(
@@ -108,10 +111,10 @@ class TestContentSafetyParserIntegration:
             context=context,
         )
 
-        assert result["allowed"] is True
+        assert result.is_blocked is False
         # following assertion fails
-        # assert result["policy_violations"] == ["S1", "S8"]
-        assert result["policy_violations"] == []
+        # assert result.metadata["policy_violations"] == ["S1", "S8"]
+        assert result.metadata["policy_violations"] == []
 
     @pytest.mark.parametrize(
         "response,expected_allowed,expected_violations",
@@ -135,8 +138,8 @@ class TestContentSafetyParserIntegration:
             context=context,
         )
 
-        assert result["allowed"] is expected_allowed
-        assert result["policy_violations"] == expected_violations
+        assert result.is_blocked == (not expected_allowed)
+        assert result.metadata["policy_violations"] == expected_violations
 
     @pytest.mark.asyncio
     async def test_content_safety_input_with_nemoguard_parser_safe(self):
@@ -153,8 +156,8 @@ class TestContentSafetyParserIntegration:
             context=context,
         )
 
-        assert result["allowed"] is True
-        assert result["policy_violations"] == []
+        assert result.is_blocked is False
+        assert result.metadata["policy_violations"] == []
 
     @pytest.mark.asyncio
     async def test_content_safety_input_with_nemoguard_parser_unsafe_with_categories(
@@ -173,8 +176,8 @@ class TestContentSafetyParserIntegration:
             context=context,
         )
 
-        assert result["allowed"] is False
-        assert result["policy_violations"] == ["S1", "S8", "S10"]
+        assert result.is_blocked is True
+        assert result.metadata["policy_violations"] == ["S1", "S8", "S10"]
 
     @pytest.mark.parametrize(
         "json_response,expected_allowed,expected_violations",
@@ -202,28 +205,43 @@ class TestContentSafetyParserIntegration:
             context=context,
         )
 
-        assert result["allowed"] is expected_allowed
-        assert result["policy_violations"] == expected_violations
+        assert result.is_blocked == (not expected_allowed)
+        assert result.metadata["policy_violations"] == expected_violations
+
+    @pytest.mark.parametrize(
+        ("action", "parser", "context"),
+        [
+            (content_safety_check_input, nemoguard_parse_prompt_safety, _create_input_context("Some content")),
+            (content_safety_check_output, nemoguard_parse_response_safety, _create_output_context()),
+        ],
+        ids=["input", "output"],
+    )
+    @pytest.mark.asyncio
+    async def test_content_safety_action_propagates_parser_error(self, action, parser, context):
+        llms, mock_task_manager = _create_mock_setup([""], None)
+        mock_task_manager.parse_task_output.side_effect = lambda task, output: parser(output)
+
+        with pytest.raises(ValueError, match="Failed to parse content safety model response"):
+            await action(
+                llms=llms,
+                llm_task_manager=mock_task_manager,
+                model_name="test_model",
+                context=context,
+            )
 
     @pytest.mark.asyncio
-    async def test_content_safety_input_with_nemoguard_parser_json_parsing_failed(
-        self,
-    ):
-        """Test input action with nemoguard_parse_prompt_safety parser; JSON parsing failure."""
-        invalid_json = '{"invalid": json}'
-        parsed_result = nemoguard_parse_prompt_safety(invalid_json)
-        llms, mock_task_manager = _create_mock_setup([invalid_json], parsed_result)
-        context = _create_input_context("Some content")
+    async def test_content_safety_parser_error_fails_closed_through_compiled_rail(self):
+        llms, mock_task_manager = _create_mock_setup([""], None)
+        mock_task_manager.parse_task_output.side_effect = lambda task, output: nemoguard_parse_prompt_safety(output)
+        dependencies = RailDependencies(llms=llms, llm_task_manager=mock_task_manager, config=MagicMock())
 
-        result = await content_safety_check_input(
-            llms=llms,
-            llm_task_manager=mock_task_manager,
-            model_name="test_model",
-            context=context,
+        outcome = await compile_rail(
+            "content safety check input $model=test_model", RailDirection.INPUT, dependencies
+        ).run([{"role": "user", "content": "Some content"}])
+
+        assert outcome == RailOutcome.block(
+            reason="content safety check input error: Failed to parse content safety model response"
         )
-
-        assert result["allowed"] is False
-        assert result["policy_violations"] == ["JSON parsing failed"]
 
 
 class TestIterableUnpackingIntegration:
@@ -261,12 +279,11 @@ class TestIterableUnpackingIntegration:
                 False,
                 ["Violence", "Hate"],
             ),
-            ("invalid json", False, ["JSON parsing failed"]),
         ],
     )
     def test_iterable_unpacking_with_nemoguard_outputs(self, json_response, expected_safe, expected_violations):
         """Test iterable unpacking directly with real NemoGuard parser outputs."""
-        if "User Safety" in json_response or json_response == "invalid json":
+        if "User Safety" in json_response:
             result = nemoguard_parse_prompt_safety(json_response)
         else:
             result = nemoguard_parse_response_safety(json_response)
@@ -398,8 +415,8 @@ class TestNemotronReasoningParserIntegration:
             context=context,
         )
 
-        assert result["allowed"] is expected_allowed
-        assert result["policy_violations"] == []
+        assert result.is_blocked == (not expected_allowed)
+        assert result.metadata["policy_violations"] == []
 
     @pytest.mark.parametrize(
         "response,expected_allowed",
@@ -424,5 +441,5 @@ class TestNemotronReasoningParserIntegration:
             context=context,
         )
 
-        assert result["allowed"] is expected_allowed
-        assert result["policy_violations"] == []
+        assert result.is_blocked == (not expected_allowed)
+        assert result.metadata["policy_violations"] == []

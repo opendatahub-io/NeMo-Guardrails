@@ -26,13 +26,25 @@ from unittest import mock
 
 import httpx
 import pytest
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from pydantic import TypeAdapter, ValidationError
 from pytest_httpx import HTTPXMock
 
-from nemoguardrails.actions.output_mapping import is_output_blocked
+from nemoguardrails.actions.rail_outcome import RailOutcome, TransformTarget
+from nemoguardrails.http import (
+    HTTPConnectionError,
+    HTTPResponse,
+    HTTPTimeoutError,
+    InstrumentedHTTPClient,
+    RetryingHTTPClient,
+    RetryPolicy,
+)
 from nemoguardrails.library.hf_classifier import backends as backends_mod
 from nemoguardrails.library.hf_classifier.actions import (
     _classify_and_check,
+    _hf_classifier_retrieval_outcome,
     hf_classifier_check_input,
     hf_classifier_check_output,
     hf_classifier_check_retrieval,
@@ -57,6 +69,7 @@ from nemoguardrails.rails.llm.config import (
     LocalHFClassifierConfig,
     RemoteHFClassifierConfig,
 )
+from nemoguardrails.testing import RecordingHTTPClient
 
 _REMOTE_DEFAULTS = dict(
     engine="vllm",
@@ -102,6 +115,14 @@ def _clear_caches():
     backends_mod._backend_instances.clear()
 
 
+@pytest.fixture
+def http_otel():
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    return provider.get_tracer("test"), exporter
+
+
 class TestConfig:
     def test_local_has_no_base_url(self):
         assert "base_url" not in LocalHFClassifierConfig.model_fields
@@ -109,11 +130,22 @@ class TestConfig:
     @pytest.mark.parametrize("engine", ["vllm", "kserve", "fms"])
     def test_remote_requires_base_url(self, engine):
         with pytest.raises(ValidationError, match="base_url"):
-            RemoteHFClassifierConfig(engine=engine, model="m", blocked_labels=["x"])
+            RemoteHFClassifierConfig(engine=engine, model="m", blocked_labels=["x"])  # type: ignore[reportCallIssue]
 
     def test_invalid_base_url_scheme(self):
         with pytest.raises(ValidationError, match="http://"):
             _remote(base_url="ftp://host:8000")
+
+    def test_api_key_requires_https_base_url(self):
+        with pytest.raises(ValidationError, match="must use HTTPS"):
+            _remote(base_url="http://host:8000", api_key_env_var="HF_TOKEN")
+
+    def test_api_key_accepts_https_base_url(self):
+        config = _remote(base_url="https://host:8000", api_key_env_var="HF_TOKEN")
+        assert config.base_url == "https://host:8000"
+
+    def test_http_base_url_remains_supported_without_api_key(self):
+        assert _remote(base_url="http://host:8000").base_url == "http://host:8000"
 
     def test_aggregation_rejects_text_classification(self):
         with pytest.raises(ValidationError, match="aggregation_strategy"):
@@ -158,11 +190,11 @@ class TestHeaders:
 
     def test_api_key(self, monkeypatch):
         monkeypatch.setenv("K", "secret")
-        h = _build_headers(_remote(api_key_env_var="K"))
+        h = _build_headers(_remote(base_url="https://host:8000", api_key_env_var="K"))
         assert h["Authorization"] == "Bearer secret"
 
     def test_missing_key_warns_once(self, caplog):
-        c = _remote(api_key_env_var="MISSING")
+        c = _remote(base_url="https://host:8000", api_key_env_var="MISSING")
         with caplog.at_level(logging.WARNING):
             _build_headers(c)
         assert "MISSING" in caplog.text
@@ -178,15 +210,16 @@ class TestHeaders:
 
 class TestSSLTimeout:
     def test_timeout_default(self):
-        assert _get_timeout(_remote()) == httpx.Timeout(30.0)
+        assert _get_timeout(_remote()) == 30.0
 
     def test_timeout_custom(self):
-        assert _get_timeout(_remote(parameters={"timeout": 10.0})) == httpx.Timeout(10.0)
+        assert _get_timeout(_remote(parameters={"timeout": 10.0})) == 10.0
 
     def test_ssl_default(self):
         cfg = _build_ssl_config(_remote())
         assert cfg.verify is True
-        assert cfg.cert is None
+        assert cfg.ca_bundle is None
+        assert cfg.client_certificate is None
 
     def test_ssl_disabled(self):
         cfg = _build_ssl_config(_remote(parameters={"verify_ssl": False}))
@@ -274,6 +307,148 @@ class TestVLLMBackend:
         httpx_mock.add_response(url=self._URL, method="POST", json={"wrong": []})
         with pytest.raises(ValueError, match="Unexpected vLLM"):
             await self._backend().classify("text")
+
+    @pytest.mark.asyncio
+    async def test_uses_injected_http_client(self):
+        client = RecordingHTTPClient(
+            [
+                HTTPResponse(
+                    status_code=200,
+                    content=b'{"data":[{"label":"safe","probs":[0.95]}]}',
+                )
+            ]
+        )
+        backend = VLLMBackend(
+            _remote(engine="vllm", base_url="http://vllm:8000"),
+            http_client=client,
+        )
+
+        result = await backend.classify("text")
+
+        assert result == [ClassificationResult(label="safe", score=0.95)]
+        assert client.requests[0].url == self._URL
+        assert client.close_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_injected_http_client_preserves_transport_retry(self):
+        client = RecordingHTTPClient(
+            [
+                HTTPConnectionError("offline"),
+                HTTPResponse(
+                    status_code=200,
+                    content=b'{"data":[{"label":"safe","probs":[0.95]}]}',
+                ),
+            ]
+        )
+        backend = VLLMBackend(
+            _remote(engine="vllm", base_url="http://vllm:8000"),
+            http_client=client,
+        )
+
+        result = await backend.classify("text")
+
+        assert result == [ClassificationResult(label="safe", score=0.95)]
+        assert len(client.requests) == 2
+
+    @pytest.mark.asyncio
+    async def test_injected_instrumented_client_observes_all_retry_attempts(self, http_otel):
+        tracer, exporter = http_otel
+        transport = RecordingHTTPClient(
+            [
+                HTTPTimeoutError("timeout"),
+                HTTPResponse(
+                    status_code=200,
+                    content=b'{"data":[{"label":"safe","probs":[0.95]}]}',
+                ),
+            ]
+        )
+        client = InstrumentedHTTPClient(transport, tracer)
+        backend = VLLMBackend(
+            _remote(engine="vllm", base_url="http://vllm:8000"),
+            http_client=client,
+        )
+
+        result = await backend.classify("text")
+
+        assert result == [ClassificationResult(label="safe", score=0.95)]
+        assert len(transport.requests) == 2
+        spans = exporter.get_finished_spans()
+        assert len(spans) == 1
+        assert spans[0].attributes["http.request.resend_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_injected_retry_policy_is_not_compounded(self, http_otel):
+        tracer, exporter = http_otel
+        transport = RecordingHTTPClient(
+            [
+                HTTPTimeoutError("first timeout"),
+                HTTPTimeoutError("second timeout"),
+                HTTPResponse(
+                    status_code=200,
+                    content=b'{"data":[{"label":"safe","probs":[0.95]}]}',
+                ),
+            ]
+        )
+        retrying = RetryingHTTPClient(
+            transport,
+            RetryPolicy(
+                max_attempts=2,
+                retryable_methods=frozenset({"POST"}),
+                retryable_status_codes=frozenset(),
+                initial_delay=0,
+                max_delay=0,
+            ),
+        )
+        client = InstrumentedHTTPClient(retrying, tracer)
+        backend = VLLMBackend(
+            _remote(engine="vllm", base_url="http://vllm:8000"),
+            http_client=client,
+        )
+
+        with pytest.raises(HTTPTimeoutError, match="second timeout"):
+            await backend.classify("text")
+
+        assert len(transport.requests) == 2
+        spans = exporter.get_finished_spans()
+        assert len(spans) == 1
+        assert spans[0].attributes["http.request.resend_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_injected_retrying_instrumented_client_is_normalized(self, http_otel):
+        tracer, exporter = http_otel
+        transport = RecordingHTTPClient(
+            [
+                HTTPTimeoutError("first timeout"),
+                HTTPTimeoutError("second timeout"),
+                HTTPResponse(
+                    status_code=200,
+                    content=b'{"data":[{"label":"safe","probs":[0.95]}]}',
+                ),
+            ]
+        )
+        instrumented = InstrumentedHTTPClient(transport, tracer)
+        client = RetryingHTTPClient(
+            instrumented,
+            RetryPolicy(
+                max_attempts=3,
+                retryable_methods=frozenset({"POST"}),
+                retryable_status_codes=frozenset(),
+                initial_delay=0,
+                max_delay=0,
+            ),
+        )
+        backend = VLLMBackend(
+            _remote(engine="vllm", base_url="http://vllm:8000"),
+            http_client=client,
+        )
+
+        result = await backend.classify("text")
+
+        assert result == [ClassificationResult(label="safe", score=0.95)]
+        assert len(transport.requests) == 3
+        spans = exporter.get_finished_spans()
+        assert len(spans) == 1
+        assert spans[0].attributes["http.request.resend_count"] == 2
 
 
 class TestKServeBackend:
@@ -407,6 +582,14 @@ class TestGetBackend:
         with pytest.raises(ValueError, match="Unknown hf_classifier engine"):
             get_backend(c)
 
+    def test_remote_backend_uses_injected_http_client(self):
+        client = RecordingHTTPClient()
+
+        backend = get_backend(_remote(engine="vllm"), http_client=client)
+
+        assert isinstance(backend, VLLMBackend)
+        assert backend._http_client is client
+
 
 class TestClassifyAndCheck:
     @pytest.mark.asyncio
@@ -499,19 +682,27 @@ class TestActionContextKeys:
                 config=cfg,
                 context=None,
             )
-        assert result is True
+        assert result == RailOutcome.allow()
 
 
-class TestOutputMapping:
-    def test_allowed_maps_to_not_blocked(self):
-        assert is_output_blocked(True, hf_classifier_check_output) is False
+class TestOutputVerdict:
+    def test_allow_outcome_is_not_blocked(self):
+        outcome = RailOutcome.allow()
 
-    def test_blocked_maps_to_blocked(self):
-        assert is_output_blocked(False, hf_classifier_check_output) is True
+        assert outcome.is_blocked is False
 
-    def test_has_explicit_output_mapping(self):
-        meta = getattr(hf_classifier_check_output, "action_meta", {})
-        assert meta.get("output_mapping") is not None
+    def test_block_outcome_is_blocked(self):
+        outcome = RailOutcome.block()
+
+        assert outcome.is_blocked is True
+
+
+class TestRetrievalOutcome:
+    def test_allowed_retrieval_maps_to_allow(self):
+        assert _hf_classifier_retrieval_outcome(True) == RailOutcome.allow()
+
+    def test_blocked_retrieval_maps_to_transform(self):
+        assert _hf_classifier_retrieval_outcome(False) == RailOutcome.transform([(TransformTarget.RELEVANT_CHUNKS, "")])
 
 
 class TestStreamingOutputFallback:
@@ -526,7 +717,7 @@ class TestStreamingOutputFallback:
                 context={"bot_message": "bad"},
                 model_name="hap",
             )
-        assert result is False
+        assert result == RailOutcome.block()
 
     @pytest.mark.asyncio
     async def test_dollar_classifier_without_model_name_raises(self):
@@ -544,13 +735,15 @@ class TestStreamingOutputFallback:
 class TestSSLCerts:
     def test_ca_cert(self):
         cfg = _build_ssl_config(_remote(parameters={"ca_cert": "/ca.pem"}))
-        assert cfg.verify == "/ca.pem"
-        assert cfg.cert is None
+        assert cfg.verify is True
+        assert cfg.ca_bundle == "/ca.pem"
+        assert cfg.client_certificate is None
 
     def test_mtls(self):
         cfg = _build_ssl_config(_remote(parameters={"client_cert": "/cert.pem", "client_key": "/key.pem"}))
         assert cfg.verify is True
-        assert cfg.cert == ("/cert.pem", "/key.pem")
+        assert cfg.client_certificate == "/cert.pem"
+        assert cfg.client_key == "/key.pem"
 
     def test_ca_cert_plus_mtls(self):
         cfg = _build_ssl_config(
@@ -562,8 +755,10 @@ class TestSSLCerts:
                 }
             )
         )
-        assert cfg.verify == "/ca.pem"
-        assert cfg.cert == ("/cert.pem", "/key.pem")
+        assert cfg.verify is True
+        assert cfg.ca_bundle == "/ca.pem"
+        assert cfg.client_certificate == "/cert.pem"
+        assert cfg.client_key == "/key.pem"
 
     def test_client_cert_without_key_raises(self):
         with pytest.raises(ValueError, match="client_key"):
@@ -738,7 +933,7 @@ class TestConnectionError:
         backend = VLLMBackend(_remote(engine="vllm", base_url="http://vllm:8000"))
         httpx_mock.add_exception(httpx.ConnectError("Connection refused"), url="http://vllm:8000/classify")
         httpx_mock.add_exception(httpx.ConnectError("Connection refused"), url="http://vllm:8000/classify")
-        with pytest.raises(httpx.ConnectError):
+        with pytest.raises(HTTPConnectionError):
             await backend.classify("text")
 
     @pytest.mark.asyncio
@@ -746,7 +941,7 @@ class TestConnectionError:
         backend = FMSBackend(_remote(engine="fms", base_url="http://fms:9000"))
         httpx_mock.add_exception(httpx.ConnectError("Connection refused"), url="http://fms:9000/api/v1/text/contents")
         httpx_mock.add_exception(httpx.ConnectError("Connection refused"), url="http://fms:9000/api/v1/text/contents")
-        with pytest.raises(httpx.ConnectError):
+        with pytest.raises(HTTPConnectionError):
             await backend.classify("text")
 
     @pytest.mark.asyncio
@@ -777,11 +972,19 @@ class TestConnectionError:
         backend = VLLMBackend(_remote(engine="vllm", base_url="http://vllm:8000"))
         httpx_mock.add_exception(httpx.ReadTimeout("timed out"), url="http://vllm:8000/classify")
         httpx_mock.add_exception(httpx.ReadTimeout("timed out"), url="http://vllm:8000/classify")
-        with pytest.raises(httpx.ReadTimeout):
+        with pytest.raises(HTTPTimeoutError):
             await backend.classify("text")
 
 
 class TestBackendCaching:
+    def test_local_backend_reports_ignored_http_client(self, caplog):
+        caplog.set_level(logging.DEBUG, logger=backends_mod.__name__)
+
+        backend = get_backend(_local(), http_client=RecordingHTTPClient())
+
+        assert isinstance(backend, LocalBackend)
+        assert "Ignoring injected HTTP client for local HF classifier backend." in caplog.text
+
     def test_get_backend_returns_same_instance(self):
         cfg = _remote(engine="vllm")
         first = get_backend(cfg, name="my_classifier")

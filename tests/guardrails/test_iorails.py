@@ -20,14 +20,22 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 
 from nemoguardrails import Guardrails
 from nemoguardrails.guardrails.guardrails_types import RailDirection, RailResult
-from nemoguardrails.guardrails.iorails import REFUSAL_MESSAGE, IORails
+from nemoguardrails.guardrails.iorails import (
+    REFUSAL_MESSAGE,
+    IORails,
+    _rewritten_bot_message,
+    _rewritten_user_message,
+)
 from nemoguardrails.guardrails.model_engine import ModelEngine
 from nemoguardrails.rails.llm.config import RailsConfig
-from nemoguardrails.rails.llm.options import GenerationOptions
+from nemoguardrails.rails.llm.options import GenerationOptions, GenerationResponse
 from nemoguardrails.types import LLMResponse, LLMResponseChunk, ToolCall, ToolCallFunction
+from tests.guardrails.rail_stubs import bot_message_rewrite, user_message_rewrite
 from tests.guardrails.test_data import CONTENT_SAFETY_CONFIG, NEMOGUARDS_CONFIG
 
 
@@ -68,6 +76,138 @@ class TestIORailsInit:
         assert iorails_sync.rails_manager.engine_registry is iorails_sync.engine_registry
 
 
+DEFAULT_HEADERS_CONFIG = {
+    "models": [
+        {
+            "type": "main",
+            "engine": "nim",
+            "model": "meta/llama-3.3-70b-instruct",
+            "parameters": {"default_headers": {"X-Main-Route": "main-pool"}},
+        },
+        {
+            "type": "content_safety",
+            "engine": "nim",
+            "model": "nvidia/llama-3.1-nemoguard-8b-content-safety",
+            "parameters": {"default_headers": {"X-Safety-Route": "safety-pool"}},
+        },
+    ],
+}
+
+
+@pytest_asyncio.fixture
+async def iorails_with_header_config():
+    """Build an IORails whose main and content_safety models carry distinct
+    parameters.default_headers, for end-to-end per-model header assertions."""
+    with patch.dict("os.environ", {"NVIDIA_API_KEY": "test-key"}):
+        iorails = IORails(RailsConfig.from_content(config=DEFAULT_HEADERS_CONFIG))
+    try:
+        yield iorails
+    finally:
+        await iorails.stop()
+
+
+class TestConfigDefaultHeadersEndToEnd:
+    """End-to-end: IORails built from config routes each model's
+    parameters.default_headers onto that model's outbound request, and the
+    main LLM and a second LLM carry only their own headers."""
+
+    @staticmethod
+    def _mock_client():
+        """Build a mock aiohttp client whose post() records its call args."""
+        mock_response = AsyncMock()
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.status = 200
+        mock_response.json = AsyncMock(return_value={"choices": [{"message": {"content": "ok"}}]})
+
+        mock_client = AsyncMock()
+        mock_client.post = MagicMock(return_value=mock_response)
+        mock_client.closed = False
+        return mock_client
+
+    async def _headers_for_model(self, iorails, model_type):
+        """Route a model_call for model_type through a mock client and return the sent headers."""
+        engine = iorails.engine_registry._get_engine(model_type, ModelEngine)
+        engine._client = self._mock_client()
+        engine._running = True
+        await iorails.engine_registry.model_call(model_type, [{"role": "user", "content": "Hi"}])
+        return engine._client.post.call_args[1]["headers"]
+
+    @pytest.mark.asyncio
+    async def test_main_llm_carries_only_its_config_headers(self, iorails_with_header_config):
+        """The main model request carries its own default_header plus base headers, and not the second model's."""
+        headers = await self._headers_for_model(iorails_with_header_config, "main")
+        assert headers["X-Main-Route"] == "main-pool"
+        assert headers["Content-Type"] == "application/json"
+        assert headers["Authorization"] == "Bearer test-key"
+        assert "X-Safety-Route" not in headers
+
+    @pytest.mark.asyncio
+    async def test_second_llm_carries_only_its_config_headers(self, iorails_with_header_config):
+        """The content_safety model request carries its own default_header plus base headers, and not the main model's."""
+        headers = await self._headers_for_model(iorails_with_header_config, "content_safety")
+        assert headers["X-Safety-Route"] == "safety-pool"
+        assert headers["Content-Type"] == "application/json"
+        assert headers["Authorization"] == "Bearer test-key"
+        assert "X-Main-Route" not in headers
+
+    @pytest.mark.asyncio
+    async def test_main_and_second_llm_get_distinct_headers(self, iorails_with_header_config):
+        """The two models' outbound header sets differ, proving per-model routing."""
+        main_headers = await self._headers_for_model(iorails_with_header_config, "main")
+        safety_headers = await self._headers_for_model(iorails_with_header_config, "content_safety")
+        assert main_headers != safety_headers
+        assert main_headers.get("X-Main-Route") == "main-pool"
+        assert safety_headers.get("X-Safety-Route") == "safety-pool"
+
+
+class TestConfigDefaultHeadersOverHTTP:
+    """True end-to-end: run generate_async over a real loopback HTTP server and
+    assert on the headers the aiohttp client actually put on the wire."""
+
+    @pytest.mark.asyncio
+    async def test_config_default_headers_sent_on_the_wire(self):
+        """A configured default_header reaches the provider request, alongside the
+        api-key Authorization, and never leaks into the JSON body."""
+        captured: dict = {}
+
+        async def handler(request):
+            captured["headers"] = dict(request.headers)
+            captured["body"] = await request.json()
+            return web.json_response({"choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+
+        app = web.Application()
+        app.router.add_post("/v1/chat/completions", handler)
+        server = TestServer(app)
+        await server.start_server()
+        try:
+            config = RailsConfig.from_content(
+                config={
+                    "models": [
+                        {
+                            "type": "main",
+                            "engine": "openai",
+                            "model": "test-model",
+                            "parameters": {
+                                "base_url": str(server.make_url("/")),
+                                "default_headers": {"X-Tenant": "acme"},
+                            },
+                        }
+                    ]
+                }
+            )
+            with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}):
+                iorails = IORails(config)
+            async with iorails:
+                result = await iorails.generate_async(messages=[{"role": "user", "content": "hi"}])
+        finally:
+            await server.close()
+
+        assert result == {"role": "assistant", "content": "ok"}
+        assert captured["headers"]["X-Tenant"] == "acme"
+        assert captured["headers"]["Authorization"] == "Bearer test-key"
+        assert "X-Tenant" not in captured["body"]
+
+
 class TestGenerateAsync:
     """Test the generate_async input-check → LLM → output-check pipeline."""
 
@@ -77,11 +217,11 @@ class TestGenerateAsync:
         messages = [{"role": "user", "content": "hi"}]
         llm_response = "Hello from LLM"
 
-        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult(is_safe=True))
+        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult.allow())
         iorails.engine_registry.model_call = AsyncMock(return_value=LLMResponse(content=llm_response))
-        iorails.rails_manager.is_output_safe = AsyncMock(return_value=RailResult(is_safe=True))
+        iorails.rails_manager.is_output_safe = AsyncMock(return_value=RailResult.allow())
 
-        result = await iorails.generate_async(messages)
+        result = await iorails.generate_async(messages=messages)
 
         assert result == {"role": "assistant", "content": llm_response}
         iorails.rails_manager.is_input_safe.assert_called_once_with(messages, enabled=True)
@@ -90,20 +230,21 @@ class TestGenerateAsync:
 
     @pytest.mark.asyncio
     async def test_safe_input_and_output_with_generation_options(self, iorails):
-        """Returns LLM response when both input and output rails pass."""
+        """Passing options returns a GenerationResponse wrapping the LLM response."""
         messages = [{"role": "user", "content": "hi"}]
         llm_response = "Hello from LLM"
 
         llm_params = {"temperature": 0.01, "max_completion_tokens": 1000}
         options = GenerationOptions(llm_params=llm_params)
 
-        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult(is_safe=True))
+        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult.allow())
         iorails.engine_registry.model_call = AsyncMock(return_value=LLMResponse(content=llm_response))
-        iorails.rails_manager.is_output_safe = AsyncMock(return_value=RailResult(is_safe=True))
+        iorails.rails_manager.is_output_safe = AsyncMock(return_value=RailResult.allow())
 
-        result = await iorails.generate_async(messages, options=options)
+        result = await iorails.generate_async(messages=messages, options=options)
 
-        assert result == {"role": "assistant", "content": llm_response}
+        assert isinstance(result, GenerationResponse)
+        assert result.response == [{"role": "assistant", "content": llm_response}]
         iorails.rails_manager.is_input_safe.assert_called_once_with(messages, enabled=True)
         iorails.engine_registry.model_call.assert_called_once_with("main", messages, **llm_params)
         iorails.rails_manager.is_output_safe.assert_called_once_with(messages, llm_response, enabled=True)
@@ -115,7 +256,7 @@ class TestGenerateAsync:
 
         async def mock_input_safe(messages, *, enabled=True):
             call_order.append("input")
-            return RailResult(is_safe=True)
+            return RailResult.allow()
 
         async def mock_generate(model_type, messages):
             call_order.append("generate")
@@ -123,24 +264,24 @@ class TestGenerateAsync:
 
         async def mock_output_safe(messages, response, *, enabled=True):
             call_order.append("output")
-            return RailResult(is_safe=True)
+            return RailResult.allow()
 
         iorails.rails_manager.is_input_safe = mock_input_safe
         iorails.engine_registry.model_call = mock_generate
         iorails.rails_manager.is_output_safe = mock_output_safe
 
-        await iorails.generate_async([{"role": "user", "content": "hi"}])
+        await iorails.generate_async(messages=[{"role": "user", "content": "hi"}])
         assert call_order == ["input", "generate", "output"]
 
     @pytest.mark.asyncio
     async def test_unsafe_input(self, iorails):
         """Returns refusal and skips LLM + output check when input is unsafe."""
-        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult(is_safe=False, reason="blocked"))
+        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult.block(reason="blocked"))
         iorails.engine_registry.model_call = AsyncMock()
         iorails.rails_manager.is_output_safe = AsyncMock()
 
         messages = [{"role": "user", "content": "bad input"}]
-        result = await iorails.generate_async(messages)
+        result = await iorails.generate_async(messages=messages)
 
         assert result == {"role": "assistant", "content": REFUSAL_MESSAGE}
         iorails.rails_manager.is_input_safe.assert_called_once_with(messages, enabled=True)
@@ -153,11 +294,11 @@ class TestGenerateAsync:
         messages = [{"role": "user", "content": "hi"}]
         llm_response = "Unsafe response from the LLM!"
 
-        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult(is_safe=True))
+        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult.allow())
         iorails.engine_registry.model_call = AsyncMock(return_value=LLMResponse(content=llm_response))
-        iorails.rails_manager.is_output_safe = AsyncMock(return_value=RailResult(is_safe=False, reason="blocked"))
+        iorails.rails_manager.is_output_safe = AsyncMock(return_value=RailResult.block(reason="blocked"))
 
-        result = await iorails.generate_async(messages)
+        result = await iorails.generate_async(messages=messages)
 
         assert result == {"role": "assistant", "content": REFUSAL_MESSAGE}
         iorails.rails_manager.is_input_safe.assert_called_once_with(messages, enabled=True)
@@ -170,12 +311,12 @@ class TestGenerateAsync:
         iorails._metrics_enabled = True
         messages = [{"role": "user", "content": "hi"}]
 
-        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult(is_safe=True))
+        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult.allow())
         iorails.engine_registry.model_call = AsyncMock(return_value=LLMResponse(content="unsafe"))
-        iorails.rails_manager.is_output_safe = AsyncMock(return_value=RailResult(is_safe=False, reason="blocked"))
+        iorails.rails_manager.is_output_safe = AsyncMock(return_value=RailResult.block(reason="blocked"))
 
         with patch("nemoguardrails.guardrails.iorails.record_request_blocked") as record_blocked:
-            result = await iorails.generate_async(messages)
+            result = await iorails.generate_async(messages=messages)
 
         assert result == {"role": "assistant", "content": REFUSAL_MESSAGE}
         record_blocked.assert_called_once_with(RailDirection.OUTPUT)
@@ -186,22 +327,22 @@ class TestGenerateAsync:
         messages = [{"role": "user", "content": "hi"}]
         llm_params = {"temperature": 0.01, "max_completion_tokens": 1000}
 
-        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult(is_safe=True))
+        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult.allow())
         iorails.engine_registry.model_call = AsyncMock(return_value=LLMResponse(content="ok"))
-        iorails.rails_manager.is_output_safe = AsyncMock(return_value=RailResult(is_safe=True))
+        iorails.rails_manager.is_output_safe = AsyncMock(return_value=RailResult.allow())
 
-        await iorails.generate_async(messages, options={"llm_params": llm_params})
+        await iorails.generate_async(messages=messages, options={"llm_params": llm_params})
 
         iorails.engine_registry.model_call.assert_called_once_with("main", messages, **llm_params)
 
     @pytest.mark.asyncio
     async def test_generate_async_propagates_exception(self, iorails):
         """Exceptions from the LLM call propagate to the caller."""
-        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult(is_safe=True))
+        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult.allow())
         iorails.engine_registry.model_call = AsyncMock(side_effect=RuntimeError("LLM internal error"))
 
         with pytest.raises(RuntimeError, match="LLM internal error"):
-            await iorails.generate_async([{"role": "user", "content": "hi"}])
+            await iorails.generate_async(messages=[{"role": "user", "content": "hi"}])
 
 
 class TestToolCalling:
@@ -214,11 +355,11 @@ class TestToolCalling:
         tool = {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}
         options = GenerationOptions(llm_params={"tools": [tool], "tool_choice": "auto", "parallel_tool_calls": True})
 
-        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult(is_safe=True))
+        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult.allow())
         iorails.engine_registry.model_call = AsyncMock(return_value=LLMResponse(content="ok"))
-        iorails.rails_manager.is_output_safe = AsyncMock(return_value=RailResult(is_safe=True))
+        iorails.rails_manager.is_output_safe = AsyncMock(return_value=RailResult.allow())
 
-        await iorails.generate_async(messages, options=options)
+        await iorails.generate_async(messages=messages, options=options)
 
         iorails.engine_registry.model_call.assert_called_once_with(
             "main", messages, tools=[tool], tool_choice="auto", parallel_tool_calls=True
@@ -236,11 +377,11 @@ class TestToolCalling:
             )
         ]
 
-        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult(is_safe=True))
+        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult.allow())
         iorails.engine_registry.model_call = AsyncMock(return_value=LLMResponse(content="", tool_calls=tool_calls))
-        iorails.rails_manager.is_output_safe = AsyncMock(return_value=RailResult(is_safe=True))
+        iorails.rails_manager.is_output_safe = AsyncMock(return_value=RailResult.allow())
 
-        result = await iorails.generate_async(messages)
+        result = await iorails.generate_async(messages=messages)
 
         assert result["role"] == "assistant"
         assert result["content"] is None
@@ -254,11 +395,11 @@ class TestToolCalling:
         messages = [{"role": "user", "content": "weather?"}]
         tool_calls = [ToolCall(id="c1", type="function", function=ToolCallFunction(name="f", arguments={}))]
 
-        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult(is_safe=True))
+        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult.allow())
         iorails.engine_registry.model_call = AsyncMock(return_value=LLMResponse(content="", tool_calls=tool_calls))
-        iorails.rails_manager.is_output_safe = AsyncMock(return_value=RailResult(is_safe=True))
+        iorails.rails_manager.is_output_safe = AsyncMock(return_value=RailResult.allow())
 
-        result = await iorails.generate_async(messages)
+        result = await iorails.generate_async(messages=messages)
 
         iorails.rails_manager.is_output_safe.assert_not_called()
         assert result["tool_calls"][0]["function"]["name"] == "f"
@@ -269,13 +410,13 @@ class TestToolCalling:
         messages = [{"role": "user", "content": "hi"}]
         tool_calls = [ToolCall(id="c1", type="function", function=ToolCallFunction(name="f", arguments={}))]
 
-        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult(is_safe=True))
+        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult.allow())
         iorails.engine_registry.model_call = AsyncMock(
             return_value=LLMResponse(content="some text", tool_calls=tool_calls)
         )
-        iorails.rails_manager.is_output_safe = AsyncMock(return_value=RailResult(is_safe=True))
+        iorails.rails_manager.is_output_safe = AsyncMock(return_value=RailResult.allow())
 
-        result = await iorails.generate_async(messages)
+        result = await iorails.generate_async(messages=messages)
 
         iorails.rails_manager.is_output_safe.assert_called_once_with(messages, "some text", enabled=True)
         assert result["content"] == "some text"
@@ -662,12 +803,12 @@ class TestAutoStart:
     async def test_generate_async_calls_start(self, iorails):
         """generate_async() calls start() automatically before running the pipeline."""
         iorails.engine_registry.start = AsyncMock()
-        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult(is_safe=True))
+        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult.allow())
         iorails.engine_registry.model_call = AsyncMock(return_value=LLMResponse(content="ok"))
-        iorails.rails_manager.is_output_safe = AsyncMock(return_value=RailResult(is_safe=True))
+        iorails.rails_manager.is_output_safe = AsyncMock(return_value=RailResult.allow())
 
         assert not iorails._running
-        await iorails.generate_async([{"role": "user", "content": "hi"}])
+        await iorails.generate_async(messages=[{"role": "user", "content": "hi"}])
 
         iorails.engine_registry.start.assert_called_once()
         assert iorails._running
@@ -676,12 +817,12 @@ class TestAutoStart:
     async def test_generate_async_start_is_idempotent(self, iorails):
         """Two generate_async() calls only trigger start() once."""
         iorails.engine_registry.start = AsyncMock()
-        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult(is_safe=True))
+        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult.allow())
         iorails.engine_registry.model_call = AsyncMock(return_value=LLMResponse(content="ok"))
-        iorails.rails_manager.is_output_safe = AsyncMock(return_value=RailResult(is_safe=True))
+        iorails.rails_manager.is_output_safe = AsyncMock(return_value=RailResult.allow())
 
-        await iorails.generate_async([{"role": "user", "content": "hi"}])
-        await iorails.generate_async([{"role": "user", "content": "hi"}])
+        await iorails.generate_async(messages=[{"role": "user", "content": "hi"}])
+        await iorails.generate_async(messages=[{"role": "user", "content": "hi"}])
 
         iorails.engine_registry.start.assert_called_once()
 
@@ -693,7 +834,7 @@ class TestAutoStart:
             yield LLMResponseChunk(delta_content="hello")
 
         iorails_input_only.engine_registry.start = AsyncMock()
-        iorails_input_only.rails_manager.is_input_safe = AsyncMock(return_value=RailResult(is_safe=True))
+        iorails_input_only.rails_manager.is_input_safe = AsyncMock(return_value=RailResult.allow())
         iorails_input_only.engine_registry.stream_model_call = mock_stream
 
         assert not iorails_input_only._running
@@ -713,7 +854,7 @@ class TestAutoStart:
             yield LLMResponseChunk(delta_content="hi")
 
         iorails_input_only.engine_registry.start = AsyncMock()
-        iorails_input_only.rails_manager.is_input_safe = AsyncMock(return_value=RailResult(is_safe=True))
+        iorails_input_only.rails_manager.is_input_safe = AsyncMock(return_value=RailResult.allow())
         iorails_input_only.engine_registry.stream_model_call = mock_stream
 
         _ = [chunk async for chunk in iorails_input_only.stream_async(messages=[{"role": "user", "content": "hi"}])]
@@ -739,13 +880,13 @@ class TestGenerate:
         messages = [{"role": "user", "content": "hi"}]
         expected = {"role": "assistant", "content": "Hello from LLM"}
 
-        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult(is_safe=True))
+        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult.allow())
         iorails.engine_registry.model_call = AsyncMock(return_value=LLMResponse(content="Hello from LLM"))
-        iorails.rails_manager.is_output_safe = AsyncMock(return_value=RailResult(is_safe=True))
+        iorails.rails_manager.is_output_safe = AsyncMock(return_value=RailResult.allow())
 
         # Patch IORails so the temp instance inside generate() uses our mocked iorails
         with patch("nemoguardrails.guardrails.iorails.IORails", return_value=iorails):
-            result = iorails.generate(messages)
+            result = iorails.generate(messages=messages)
 
         assert result == expected
 
@@ -755,12 +896,12 @@ class TestGenerate:
         messages = [{"role": "user", "content": "hi"}]
         options = GenerationOptions(llm_params={"temperature": 0.5})
 
-        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult(is_safe=True))
+        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult.allow())
         iorails.engine_registry.model_call = AsyncMock(return_value=LLMResponse(content="response"))
-        iorails.rails_manager.is_output_safe = AsyncMock(return_value=RailResult(is_safe=True))
+        iorails.rails_manager.is_output_safe = AsyncMock(return_value=RailResult.allow())
 
         with patch("nemoguardrails.guardrails.iorails.IORails", return_value=iorails):
-            iorails.generate(messages, options=options)
+            iorails.generate(messages=messages, options=options)
 
         iorails.engine_registry.model_call.assert_called_once_with("main", messages, temperature=0.5)
 
@@ -769,12 +910,12 @@ class TestGenerate:
         iorails = iorails_sync
         messages = [{"role": "user", "content": "hi"}]
 
-        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult(is_safe=True))
+        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult.allow())
         iorails.engine_registry.model_call = AsyncMock(return_value=LLMResponse(content="response"))
-        iorails.rails_manager.is_output_safe = AsyncMock(return_value=RailResult(is_safe=True))
+        iorails.rails_manager.is_output_safe = AsyncMock(return_value=RailResult.allow())
 
         with patch("nemoguardrails.guardrails.iorails.IORails", return_value=iorails) as mock_iorails:
-            iorails.generate(messages)
+            iorails.generate(messages=messages)
 
         mock_iorails.assert_called_once()
         assert mock_iorails.call_args.kwargs == {"_report_usage": False}
@@ -783,7 +924,7 @@ class TestGenerate:
         """generate() raises RuntimeError when called inside a running event loop."""
 
         async def call_generate():
-            iorails_sync.generate([{"role": "user", "content": "hi"}])
+            iorails_sync.generate(messages=[{"role": "user", "content": "hi"}])
 
         with pytest.raises(RuntimeError):
             asyncio.run(call_generate())
@@ -849,7 +990,7 @@ class TestIORailsConfigToCallURL:
         main_engine._running = True
 
         try:
-            await iorails.generate_async([{"role": "user", "content": "Hi"}])
+            await iorails.generate_async(messages=[{"role": "user", "content": "Hi"}])
         finally:
             await iorails.stop()
 
@@ -934,3 +1075,151 @@ class TestGuardrailsConfigToCallURLs:
             url = call_args[0][0]
             assert url == "https://safety.example.com/v1/chat/completions"
             assert "/v1/v1/" not in url
+
+
+REWRITE_USER_TEXT = "my ssn is 123-45-6789"
+REWRITE_MASKED_USER = "my ssn is <SSN>"
+REWRITE_MESSAGES = [{"role": "user", "content": REWRITE_USER_TEXT}]
+
+
+@pytest.mark.asyncio
+class TestGenerateWithRewritingRails:
+    """A rail's rewrite reaches the model and the caller, rather than being computed and dropped."""
+
+    async def test_an_input_rewrite_is_what_the_model_reads(self, iorails):
+        """Masking that never reaches the model would leave the model reading the raw text."""
+        iorails.rails_manager.is_input_safe = AsyncMock(return_value=user_message_rewrite(REWRITE_MASKED_USER))
+        iorails.rails_manager.is_output_safe = AsyncMock(return_value=RailResult.allow())
+        iorails.engine_registry.model_call = AsyncMock(return_value=LLMResponse(content="sure"))
+
+        await iorails.generate_async(messages=REWRITE_MESSAGES)
+
+        sent_messages = iorails.engine_registry.model_call.call_args.args[1]
+        assert sent_messages[-1]["content"] == REWRITE_MASKED_USER
+
+    async def test_an_input_rewrite_leaves_the_callers_messages_untouched(self, iorails):
+        """The caller's conversation is theirs; masking it as a side effect would be a surprise."""
+        iorails.rails_manager.is_input_safe = AsyncMock(return_value=user_message_rewrite(REWRITE_MASKED_USER))
+        iorails.rails_manager.is_output_safe = AsyncMock(return_value=RailResult.allow())
+        iorails.engine_registry.model_call = AsyncMock(return_value=LLMResponse(content="sure"))
+        messages = [{"role": "user", "content": REWRITE_USER_TEXT}]
+
+        await iorails.generate_async(messages=messages)
+
+        assert messages == [{"role": "user", "content": REWRITE_USER_TEXT}]
+
+    async def test_an_output_rewrite_is_what_the_caller_receives(self, iorails):
+        """The whole point of an output rewrite: the caller reads the sanitized response."""
+        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult.allow())
+        iorails.rails_manager.is_output_safe = AsyncMock(return_value=bot_message_rewrite("call me on <PHONE>"))
+        iorails.engine_registry.model_call = AsyncMock(return_value=LLMResponse(content="call me on 555-0100"))
+
+        result = await iorails.generate_async(messages=REWRITE_MESSAGES)
+
+        assert result == {"role": "assistant", "content": "call me on <PHONE>"}
+
+    async def test_an_output_rewrite_reaches_the_structured_response(self, iorails):
+        """The options path returns the same text as the bare one, not the pre-rewrite response."""
+        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult.allow())
+        iorails.rails_manager.is_output_safe = AsyncMock(return_value=bot_message_rewrite("call me on <PHONE>"))
+        iorails.engine_registry.model_call = AsyncMock(return_value=LLMResponse(content="call me on 555-0100"))
+
+        result = await iorails.generate_async(messages=REWRITE_MESSAGES, options={"log": {"activated_rails": True}})
+
+        assert isinstance(result, GenerationResponse)
+        assert result.response == [{"role": "assistant", "content": "call me on <PHONE>"}]
+
+
+class TestRewriteReaders:
+    """The two readers that turn a rail verdict into the text a direction should use."""
+
+    def test_a_user_rewrite_is_read_by_the_input_reader(self):
+        """The text an input rail produced, which the model and the later rails must read."""
+        assert _rewritten_user_message(user_message_rewrite(REWRITE_MASKED_USER)) == REWRITE_MASKED_USER
+
+    def test_a_bot_rewrite_is_read_by_the_output_reader(self):
+        """The text an output rail produced, which is what the caller receives."""
+        assert _rewritten_bot_message(bot_message_rewrite("call me on <PHONE>")) == "call me on <PHONE>"
+
+    @pytest.mark.parametrize(
+        "result",
+        [RailResult.allow(), RailResult.block(reason="unsafe")],
+        ids=["allow", "block"],
+    )
+    def test_a_verdict_without_a_rewrite_reads_as_nothing_to_apply(self, result):
+        """Most requests to a rewriting rail come back as a plain verdict, and must change nothing."""
+        assert _rewritten_user_message(result) is None
+        assert _rewritten_bot_message(result) is None
+
+    def test_each_reader_ignores_the_other_directions_rewrite(self):
+        """The readers are target-specific, so a rewrite cannot be applied to the wrong variable."""
+        assert _rewritten_user_message(bot_message_rewrite("call me on <PHONE>")) is None
+        assert _rewritten_bot_message(user_message_rewrite(REWRITE_MASKED_USER)) is None
+
+    def test_a_rewrite_to_empty_text_is_still_a_rewrite(self):
+        """Redacting to nothing must not read as "no rewrite" the way an empty string would."""
+        assert _rewritten_bot_message(bot_message_rewrite("")) == ""
+
+
+@pytest.mark.asyncio
+class TestGeneratedTurn:
+    """``_do_generate_sequential`` reports the response together with the messages behind it."""
+
+    async def test_a_rewritten_turn_carries_the_messages_the_model_read(self, iorails):
+        """The caller of this helper runs the output rails, and must not re-read the stale list."""
+        iorails.rails_manager.is_input_safe = AsyncMock(return_value=user_message_rewrite(REWRITE_MASKED_USER))
+        iorails.engine_registry.model_call = AsyncMock(return_value=LLMResponse(content="sure"))
+
+        turn = await iorails._do_generate_sequential(REWRITE_MESSAGES, "req-1", {})
+
+        assert turn.messages[-1]["content"] == REWRITE_MASKED_USER
+        assert turn.response is not None
+
+    async def test_an_unrewritten_turn_carries_the_messages_as_they_arrived(self, iorails):
+        """Nothing is copied or rebuilt for the ordinary case where no rail rewrites."""
+        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult.allow())
+        iorails.engine_registry.model_call = AsyncMock(return_value=LLMResponse(content="sure"))
+
+        turn = await iorails._do_generate_sequential(REWRITE_MESSAGES, "req-1", {})
+
+        assert turn.messages is REWRITE_MESSAGES
+
+    async def test_a_blocked_turn_reports_no_response(self, iorails):
+        """The block is signalled by the absent response, which is what the caller branches on."""
+        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult.block(reason="unsafe"))
+        iorails.engine_registry.model_call = AsyncMock()
+
+        turn = await iorails._do_generate_sequential(REWRITE_MESSAGES, "req-1", {})
+
+        assert turn.response is None
+        assert turn.messages is REWRITE_MESSAGES
+        iorails.engine_registry.model_call.assert_not_called()
+
+
+@pytest.mark.asyncio
+class TestContentCaptureRecordsWhatTheModelRead:
+    """Capture records the masked text, so a span cannot carry what a mask removed."""
+
+    async def test_the_request_span_carries_the_masked_input(self, iorails):
+        """A trace is a downstream system, and masking exists to keep the raw text out of them."""
+        iorails._content_capture_enabled = True
+        iorails.rails_manager.is_input_safe = AsyncMock(return_value=user_message_rewrite(REWRITE_MASKED_USER))
+        iorails.rails_manager.is_output_safe = AsyncMock(return_value=RailResult.allow())
+        iorails.engine_registry.model_call = AsyncMock(return_value=LLMResponse(content="sure"))
+
+        with patch("nemoguardrails.guardrails.iorails.set_request_content") as capture:
+            await iorails.generate_async(messages=REWRITE_MESSAGES)
+
+        assert capture.call_args.args[1][-1]["content"] == REWRITE_MASKED_USER
+
+    async def test_an_unmasked_turn_is_captured_as_it_arrived(self, iorails):
+        """The ordinary request is unchanged: what the caller sent is what the span records."""
+        iorails._content_capture_enabled = True
+        iorails.rails_manager.is_input_safe = AsyncMock(return_value=RailResult.allow())
+        iorails.rails_manager.is_output_safe = AsyncMock(return_value=RailResult.allow())
+        iorails.engine_registry.model_call = AsyncMock(return_value=LLMResponse(content="sure"))
+
+        with patch("nemoguardrails.guardrails.iorails.set_request_content") as capture:
+            await iorails.generate_async(messages=REWRITE_MESSAGES)
+
+        assert capture.call_args.args[1] == REWRITE_MESSAGES
