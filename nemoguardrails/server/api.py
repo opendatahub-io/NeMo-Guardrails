@@ -47,7 +47,7 @@ from nemoguardrails.http.errors import HTTPClientError
 from nemoguardrails.llm.clients._errors import build_error_payload, normalize_error_status
 from nemoguardrails.llm.models.initializer import ModelInitializationError
 from nemoguardrails.rails.llm.config import Model
-from nemoguardrails.rails.llm.options import GenerationOptions, GenerationResponse, RailStatus
+from nemoguardrails.rails.llm.options import GenerationResponse, RailStatus
 from nemoguardrails.server.datastore.datastore import DataStore
 from nemoguardrails.server.exception_handlers import (
     bad_request_error_handler,
