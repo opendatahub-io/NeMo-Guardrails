@@ -24,6 +24,10 @@ import pytest
 pytest.importorskip("openai", reason="openai is required for server tests")
 from fastapi.testclient import TestClient
 
+from nemoguardrails import RailsConfig
+from nemoguardrails.guardrails.model_engine import ModelEngine
+from nemoguardrails.llm.models.openai_chat import OpenAIChatModel
+from nemoguardrails.rails import LLMRails
 from nemoguardrails.server import api
 from nemoguardrails.server.api import _format_streaming_response
 from nemoguardrails.server.schemas.openai import GuardrailsChatCompletionRequest
@@ -166,6 +170,82 @@ def test_model_field_independent_of_config_id():
     assert request_body.guardrails.config_ids == ["test_config"]
 
 
+@pytest.fixture
+def injected_model_config(monkeypatch):
+    monkeypatch.setenv("CUSTOM_MAIN_API_KEY", "main-key")
+    monkeypatch.setenv("MAIN_MODEL_BASE_URL", "https://request.example/v1")
+    config = RailsConfig.from_content(
+        config={
+            "models": [
+                {
+                    "type": "main",
+                    "engine": "nim",
+                    "model": "configured-model",
+                    "api_key_env_var": "CUSTOM_MAIN_API_KEY",
+                    "parameters": {
+                        "base_url": "https://configured.example/v1",
+                        "default_headers": {"X-Tenant": "acme"},
+                    },
+                }
+            ]
+        }
+    )
+    return api._inject_model(config, "requested-model")
+
+
+def test_inject_model_preserves_main_model_api_key_env_var(injected_model_config):
+    main_model = injected_model_config.models[0]
+    headers = ModelEngine(main_model)._prepare_request([{"role": "user", "content": "hi"}]).headers
+
+    assert main_model.model == "requested-model"
+    assert main_model.engine == "custom_llm"
+    assert main_model.api_key_env_var == "CUSTOM_MAIN_API_KEY"
+    assert main_model.parameters == {
+        "base_url": "https://request.example/v1",
+        "default_headers": {"X-Tenant": "acme"},
+    }
+    assert headers["Authorization"] == "Bearer main-key"
+    assert headers["X-Tenant"] == "acme"
+
+
+def test_inject_model_preserves_main_model_api_key_for_llmrails(injected_model_config):
+    rails = LLMRails(config=injected_model_config.model_copy(deep=True))
+
+    assert isinstance(rails.llm, OpenAIChatModel)
+    headers = rails.llm._client._build_headers()
+    assert rails.llm.model_name == "requested-model"
+    assert rails.llm.provider_name == "custom_llm"
+    assert headers["Authorization"] == "Bearer main-key"
+    assert headers["X-Tenant"] == "acme"
+
+
+def test_thread_id_without_datastore_returns_400(monkeypatch):
+    mock_rails = AsyncMock()
+    mock_rails.config = RailsConfig.from_content(config={"models": []})
+    monkeypatch.setattr(api, "datastore", None)
+
+    with patch("nemoguardrails.server.api._get_rails", new=AsyncMock(return_value=mock_rails)):
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "guardrails": {
+                    "config_id": "test_config",
+                    "thread_id": "0123456789abcdef",
+                },
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == {
+        "message": "Conversation threads are not enabled on this server.",
+        "type": "invalid_request_error",
+        "param": None,
+        "code": None,
+    }
+
+
 def test_request_body_state():
     """Test GuardrailsChatCompletionRequest state handling."""
     data = {
@@ -213,9 +293,25 @@ def test_request_body_messages():
         "messages": [{"content": "Hello"}],
         "guardrails": {"config_id": "test_config"},
     }
-    request_body = GuardrailsChatCompletionRequest.model_validate(data)
-    assert request_body.messages is not None
-    assert len(request_body.messages) == 1
+    with pytest.raises(ValueError, match="role"):
+        GuardrailsChatCompletionRequest.model_validate(data)
+
+
+def test_chat_completion_rejects_message_without_role():
+    with patch("nemoguardrails.server.api._get_rails", new=AsyncMock()) as get_rails:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-4o",
+                "messages": [{"content": "Hello"}],
+                "guardrails": {"config_id": "test_config"},
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert response.json()["error"]["param"] == "messages.0.role"
+    get_rails.assert_not_awaited()
 
 
 def test_request_body_tools_and_tool_choice():
@@ -318,6 +414,39 @@ def test_chat_completion_passes_tools_to_llm_params():
     assert captured_options["options"].llm_params["parallel_tool_calls"] is False
 
 
+@pytest.mark.parametrize("stop", ["END", ["END"], None])
+def test_chat_completion_accepts_stop_parameter(stop):
+    from nemoguardrails.rails.llm.options import GenerationResponse
+
+    captured_options = {}
+
+    async def mock_generate_async(*, messages, options, state):
+        captured_options["options"] = options
+        return GenerationResponse(response=[{"role": "assistant", "content": "ok"}])
+
+    mock_rails = AsyncMock()
+    mock_rails.generate_async = mock_generate_async
+    mock_rails.config.colang_version = "1.0"
+    mock_rails.config.passthrough = False
+
+    with patch("nemoguardrails.server.api._get_rails", new=AsyncMock(return_value=mock_rails)):
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stop": stop,
+                "guardrails": {"config_id": "with_custom_llm"},
+            },
+        )
+
+    assert response.status_code == 200
+    if stop is None:
+        assert "stop" not in captured_options["options"].llm_params
+    else:
+        assert captured_options["options"].llm_params["stop"] == stop
+
+
 def test_chat_completion_rejects_tools_for_non_passthrough_config():
     """Test that tools/tool_choice/parallel_tool_calls are rejected unless passthrough is True."""
     mock_rails = AsyncMock()
@@ -338,7 +467,7 @@ def test_chat_completion_rejects_tools_for_non_passthrough_config():
         )
 
     assert response.status_code == 422
-    assert "passthrough" in response.json()["detail"].lower()
+    assert "passthrough" in response.json()["error"]["message"].lower()
 
 
 def test_chat_completion_rejects_tool_choice_without_passthrough():
@@ -359,7 +488,7 @@ def test_chat_completion_rejects_tool_choice_without_passthrough():
         )
 
     assert response.status_code == 422
-    assert "passthrough" in response.json()["detail"].lower()
+    assert "passthrough" in response.json()["error"]["message"].lower()
 
 
 def test_chat_completion_rejects_tools_with_streaming_even_in_passthrough():
@@ -383,7 +512,7 @@ def test_chat_completion_rejects_tools_with_streaming_even_in_passthrough():
         )
 
     assert response.status_code == 422
-    assert "passthrough" in response.json()["detail"].lower()
+    assert "passthrough" in response.json()["error"]["message"].lower()
 
 
 def test_chat_completion_returns_tool_calls():
@@ -537,8 +666,8 @@ def test_no_config_error_returns_proper_response():
     )
     assert response.status_code == 422
     res = response.json()
-    assert "detail" in res
-    assert "config" in res["detail"].lower()
+    assert "error" in res
+    assert "config" in res["error"]["message"].lower()
 
 
 def test_invalid_state_returns_error():
@@ -556,8 +685,8 @@ def test_invalid_state_returns_error():
     )
     assert response.status_code == 422
     res = response.json()
-    assert "detail" in res
-    assert "state" in res["detail"].lower() or "events" in res["detail"].lower()
+    assert "error" in res
+    assert "state" in res["error"]["message"].lower() or "events" in res["error"]["message"].lower()
 
 
 def test_chat_completion_response_structure():
@@ -931,7 +1060,7 @@ def test_list_models_no_base_url_known_engine():
         os.environ.pop("MAIN_MODEL_BASE_URL", None)
         response = client.get("/v1/models")
     assert response.status_code == 502
-    assert "MAIN_MODEL_BASE_URL" in response.json()["detail"]
+    assert "MAIN_MODEL_BASE_URL" in response.json()["error"]["message"]
 
 
 def test_list_models_unknown_engine_no_base_url():
@@ -989,9 +1118,10 @@ def test_list_models_empty_upstream():
     assert data["data"] == []
 
 
-def test_list_models_upstream_error():
+def test_list_models_upstream_error(caplog):
     """Test /v1/models returns upstream error status on HTTP error."""
-    mock_response = _make_httpx_response({"error": "unauthorized"}, status_code=401)
+    sensitive_detail = "upstream-secret-detail"
+    mock_response = _make_httpx_response({"error": sensitive_detail}, status_code=401)
     mock_client = AsyncMock()
     mock_client.get = AsyncMock(return_value=mock_response)
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
@@ -1002,7 +1132,23 @@ def test_list_models_upstream_error():
             response = client.get("/v1/models")
 
     assert response.status_code == 401
-    assert "Error fetching models from upstream" in response.json()["detail"]
+    assert "Error fetching models from upstream" in response.json()["error"]["message"]
+    assert sensitive_detail not in caplog.text
+
+
+def test_list_models_redirect_is_clamped_to_internal_error():
+    mock_response = _make_httpx_response({"error": "redirect"}, status_code=302)
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=mock_response)
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch.dict(os.environ, {"MAIN_MODEL_BASE_URL": "http://localhost:8000"}):
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            response = client.get("/v1/models")
+
+    assert response.status_code == 500
+    assert response.json()["error"]["type"] == "server_error"
 
 
 def test_list_models_connection_error():
@@ -1017,7 +1163,7 @@ def test_list_models_connection_error():
             response = client.get("/v1/models")
 
     assert response.status_code == 502
-    assert "Error connecting to upstream" in response.json()["detail"]
+    assert "Error connecting to upstream" in response.json()["error"]["message"]
 
 
 def test_list_models_forwards_auth_header():

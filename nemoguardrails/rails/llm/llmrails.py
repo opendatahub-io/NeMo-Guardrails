@@ -49,7 +49,7 @@ from nemoguardrails.actions.llm.utils import (
     get_and_clear_response_metadata_contextvar,
     get_colang_history,
 )
-from nemoguardrails.actions.output_mapping import is_output_blocked
+from nemoguardrails.actions.rail_outcome import require_rail_outcome
 from nemoguardrails.actions.v2_x.generation import LLMGenerationActionsV2dotx
 from nemoguardrails.base_guardrails import BaseGuardrails
 from nemoguardrails.colang import parse_colang_file
@@ -76,10 +76,12 @@ from nemoguardrails.exceptions import (
     InvalidModelConfigurationError,
     InvalidRailsConfigurationError,
     InvalidStateError,
+    RailTypeNotConfiguredError,
     StreamingNotSupportedError,
 )
 from nemoguardrails.kb.kb import KnowledgeBase
 from nemoguardrails.llm.cache import CacheInterface, LFUCache
+from nemoguardrails.llm.clients._errors import build_streaming_error_payload
 from nemoguardrails.llm.models.initializer import (
     ModelInitializationError,
     init_llm_model,
@@ -110,7 +112,6 @@ from nemoguardrails.rails.llm.utils import (
 from nemoguardrails.streaming import END_OF_STREAM, StreamingHandler
 from nemoguardrails.types import LLMModel
 from nemoguardrails.utils import (
-    extract_error_json,
     get_or_create_event_loop,
     new_event_dict,
     new_uuid,
@@ -1078,9 +1079,7 @@ class LLMRails(BaseGuardrails):
                 streaming_handler = streaming_handler_var.get()
                 if streaming_handler:
                     # Push an error chunk instead of None.
-                    error_message = str(e)
-                    error_dict = extract_error_json(error_message)
-                    error_payload: str = json.dumps(error_dict)
+                    error_payload: str = build_streaming_error_payload(e)
                     await streaming_handler.push_chunk(error_payload)
                     # push a termination signal
                     await streaming_handler.push_chunk(END_OF_STREAM)
@@ -1451,9 +1450,7 @@ class LLMRails(BaseGuardrails):
                 # If an exception occurs during generation, push it to the streaming handler as a json string
                 # This ensures the streaming pipeline is properly terminated
                 log.error(f"Error in generation task: {e}", exc_info=True)
-                error_message = str(e)
-                error_dict = extract_error_json(error_message)
-                error_payload = json.dumps(error_dict)
+                error_payload = build_streaming_error_payload(e)
                 await streaming_handler.push_chunk(error_payload)
                 await streaming_handler.push_chunk(END_OF_STREAM)
 
@@ -1678,8 +1675,15 @@ class LLMRails(BaseGuardrails):
             Run only input rails explicitly::
 
                 result = await rails.check_async(messages, rail_types=[RailType.INPUT])
+
+        Raises:
+            RailTypeNotConfiguredError: If a requested rail type has no
+                configured flows.
         """
         if rail_types is not None:
+            for rt in rail_types:
+                if not getattr(self.config.rails, rt.value).flows:
+                    raise RailTypeNotConfiguredError(f"Requested rail type '{rt.value}' has no configured rails.")
             options: Optional[dict] = {"rails": [r.value for r in rail_types]}
         else:
             options = _determine_rails_from_messages(messages)
@@ -1727,6 +1731,10 @@ class LLMRails(BaseGuardrails):
 
         Returns:
             RailsResult containing status, content, and optional blocking rail name.
+
+        Raises:
+            RailTypeNotConfiguredError: If a requested rail type has no
+                configured flows.
         """
         if check_sync_call_from_async_loop():
             raise RuntimeError(
@@ -2051,10 +2059,23 @@ class LLMRails(BaseGuardrails):
                         yield json.dumps(error_data)
                         return
 
-                    action_func = self.runtime.action_dispatcher.get_action(action_name)
+                    try:
+                        outcome = require_rail_outcome(result)
+                    except TypeError as e:
+                        error_message = str(e)
+                        log.error(error_message)
+                        error_data = {
+                            "error": {
+                                "message": f"Internal error in {flow_id} rail: {error_message}",
+                                "type": "internal_error",
+                                "param": flow_id,
+                                "code": "rail_execution_failure",
+                            }
+                        }
+                        yield json.dumps(error_data)
+                        return
 
-                    # Use the mapping to decide if the result indicates blocked content.
-                    if is_output_blocked(result, action_func):
+                    if outcome.is_blocked:
                         reason = f"Blocked by {flow_id} rails."
 
                         # return the error as a plain JSON string (not in SSE format)

@@ -13,18 +13,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from typing import Any, Dict, List, Optional
 
 import pytest
 
 from nemoguardrails import RailsConfig
 from nemoguardrails.actions.actions import ActionResult, action
+from nemoguardrails.actions.rail_outcome import RailOutcome, TransformTarget
+from nemoguardrails.http import HTTPConnectionError, HTTPResponse, HTTPTimeoutError
 from nemoguardrails.library.polygraf.actions import (
     FAILSAFE_MASK_PLACEHOLDER,
+    _entity_shape,
     polygraf_detect_pii,
     polygraf_mask_pii,
 )
 from nemoguardrails.library.polygraf.request import polygraf_request
+from nemoguardrails.testing import RecordingHTTPClient
 from tests.utils import TestChat
 
 
@@ -65,11 +70,13 @@ def create_polygraf_mock_response(
 
 
 def create_mock_polygraf_detect_pii(entities_to_detect: Optional[List[str]] = None):
-    """Create a mock polygraf_detect_pii action that returns True when PII is detected."""
+    """Create a mock polygraf_detect_pii action."""
 
     async def mock_polygraf_detect_pii(source: str, text: str, config, **kwargs):
         entities = create_polygraf_mock_response(text, entities_to_detect)
-        return len(entities) > 0
+        if entities:
+            return RailOutcome.block(metadata={"has_pii": True})
+        return RailOutcome.allow(metadata={"has_pii": False})
 
     return mock_polygraf_detect_pii
 
@@ -80,7 +87,7 @@ def create_mock_polygraf_mask_pii(entities_to_detect: Optional[List[str]] = None
     async def mock_polygraf_mask_pii(source: str, text: str, config, **kwargs):
         entities = create_polygraf_mock_response(text, entities_to_detect)
         if not entities:
-            return text
+            return RailOutcome.allow(metadata={"source": source, "text": text, "masked_text": text})
 
         masked_text = text
         for entity in sorted(entities, key=lambda x: x["start"], reverse=True):
@@ -89,7 +96,14 @@ def create_mock_polygraf_mask_pii(entities_to_detect: Optional[List[str]] = None
             entity_type = entity["entity_type"]
             masked_text = masked_text[:start] + f"<{entity_type}>" + masked_text[end:]
 
-        return masked_text
+        targets = {
+            "input": TransformTarget.USER_MESSAGE,
+            "output": TransformTarget.BOT_MESSAGE,
+            "retrieval": TransformTarget.RELEVANT_CHUNKS,
+        }
+        return RailOutcome.transform(
+            [(targets[source], masked_text)], metadata={"source": source, "text": text, "masked_text": masked_text}
+        )
 
     return mock_polygraf_mask_pii
 
@@ -128,167 +142,156 @@ def _polygraf_config():
     )
 
 
-class _FakeResponse:
-    def __init__(self, status=200, payload=None, text=""):
-        self.status = status
-        self._payload = payload if payload is not None else []
-        self._text = text
-
-    async def json(self):
-        return self._payload
-
-    async def text(self):
-        return self._text
+def test_polygraf_entity_shape_does_not_include_values():
+    assert _entity_shape({"entity_type": "Email", "entity_text": "secret@example.com"}) == (
+        "dict(keys=['entity_text', 'entity_type'])"
+    )
+    assert _entity_shape("secret@example.com") == "str"
 
 
-class _FakePostContextManager:
-    def __init__(self, response):
-        self.response = response
+@pytest.mark.parametrize(("entity_type", "is_blocked"), [("Person", True), ("CreditCard", False)])
+@pytest.mark.asyncio
+async def test_polygraf_detect_pii_filters_valid_entities(monkeypatch, entity_type, is_blocked):
+    async def mock_request(text, server_endpoint, api_key, http_client=None):
+        return [{"entity_type": entity_type, "start": 0, "end": 4}]
 
-    async def __aenter__(self):
-        return self.response
+    monkeypatch.setenv("POLYGRAF_API_KEY", "secret")
+    monkeypatch.setattr("nemoguardrails.library.polygraf.actions.polygraf_request", mock_request)
 
-    async def __aexit__(self, exc_type, exc, tb):
-        return False
+    result = await polygraf_detect_pii("input", "John", _polygraf_config())
 
-
-class _FakeSession:
-    def __init__(self, response):
-        self.response = response
-        self.requests = []
-
-    def post(self, server_endpoint, json, headers):
-        self.requests.append(
-            {
-                "server_endpoint": server_endpoint,
-                "json": json,
-                "headers": headers,
-            }
-        )
-        return _FakePostContextManager(self.response)
+    assert result.is_blocked is is_blocked
 
 
 @pytest.mark.asyncio
-async def test_polygraf_request_uses_shared_session_and_bearer_auth():
-    session = _FakeSession(
-        _FakeResponse(
-            payload=[
-                {
-                    "entity_type": "Person",
-                    "entity_text": "John",
-                    "start": 0,
-                    "end": 4,
-                    "score": 0.99,
-                }
-            ]
-        )
+async def test_polygraf_detect_pii_fails_closed_on_non_mapping_entity(monkeypatch):
+    async def mock_request(text, server_endpoint, api_key, http_client=None):
+        return ["secret@example.com"]
+
+    monkeypatch.setenv("POLYGRAF_API_KEY", "secret")
+    monkeypatch.setattr("nemoguardrails.library.polygraf.actions.polygraf_request", mock_request)
+
+    result = await polygraf_detect_pii("input", "John", _polygraf_config())
+
+    assert result.is_blocked
+
+
+@pytest.mark.asyncio
+async def test_polygraf_actions_reject_unknown_source():
+    with pytest.raises(ValueError, match="current flow, 'unknown'"):
+        await polygraf_detect_pii("unknown", "John", _polygraf_config())
+
+
+@pytest.mark.asyncio
+async def test_polygraf_mask_pii_allows_when_no_entities(monkeypatch):
+    async def mock_request(text, server_endpoint, api_key, http_client=None):
+        return []
+
+    monkeypatch.setenv("POLYGRAF_API_KEY", "secret")
+    monkeypatch.setattr("nemoguardrails.library.polygraf.actions.polygraf_request", mock_request)
+
+    result = await polygraf_mask_pii("input", "Hello", _polygraf_config())
+
+    assert not result.is_blocked
+    assert not result.transforms
+
+
+def _http_response(payload=None, *, status: int = 200, text: str = "") -> HTTPResponse:
+    content = text.encode() if text else json.dumps(payload if payload is not None else []).encode()
+    return HTTPResponse(status_code=status, content=content)
+
+
+@pytest.mark.asyncio
+async def test_polygraf_request_uses_shared_client_and_bearer_auth():
+    client = RecordingHTTPClient(
+        [
+            _http_response(
+                [
+                    {
+                        "entity_type": "Person",
+                        "entity_text": "John",
+                        "start": 0,
+                        "end": 4,
+                        "score": 0.99,
+                    }
+                ]
+            )
+        ]
     )
 
-    entities = await polygraf_request("John", "http://polygraf.example/pii", "secret", session=session)
+    entities = await polygraf_request("John", "http://polygraf.example/pii", "secret", http_client=client)
 
     assert entities[0]["entity_type"] == "Person"
-    assert session.requests[0]["headers"]["Authorization"] == "Bearer secret"
-    assert session.requests[0]["json"]["detect_pid"] is True
-    assert session.requests[0]["json"]["aggregate_entities"] is True
+    assert client.requests[0].headers["Authorization"] == "Bearer secret"
+    assert client.requests[0].json["detect_pid"] is True
+    assert client.requests[0].json["aggregate_entities"] is True
 
 
 @pytest.mark.asyncio
 async def test_polygraf_request_accepts_wrapped_entities_response():
-    session = _FakeSession(_FakeResponse(payload={"entities": [{"entity_type": "Email"}]}))
+    client = RecordingHTTPClient([_http_response({"entities": [{"entity_type": "Email"}]})])
 
-    entities = await polygraf_request("test@gmail.com", "http://polygraf.example/pii", None, session=session)
+    entities = await polygraf_request("test@gmail.com", "http://polygraf.example/pii", None, http_client=client)
 
     assert entities == [{"entity_type": "Email"}]
 
 
 @pytest.mark.asyncio
 async def test_polygraf_request_accepts_null_entities_as_empty_response():
-    session = _FakeSession(_FakeResponse(payload={"entities": None}))
+    client = RecordingHTTPClient([_http_response({"entities": None})])
 
-    entities = await polygraf_request("hello", "http://polygraf.example/pii", None, session=session)
+    entities = await polygraf_request("hello", "http://polygraf.example/pii", None, http_client=client)
 
     assert entities == []
 
 
 @pytest.mark.asyncio
 async def test_polygraf_request_raises_for_invalid_response_shape():
-    session = _FakeSession(_FakeResponse(payload={"unexpected": []}))
+    client = RecordingHTTPClient([_http_response({"unexpected": []})])
 
     with pytest.raises(ValueError, match="Invalid response from Polygraf service"):
-        await polygraf_request("John", "http://polygraf.example/pii", None, session=session)
+        await polygraf_request("John", "http://polygraf.example/pii", None, http_client=client)
 
 
 @pytest.mark.asyncio
 async def test_polygraf_request_raises_for_non_200_response():
-    session = _FakeSession(_FakeResponse(status=401, text="missing token"))
+    client = RecordingHTTPClient([_http_response(status=401, text="missing token")])
 
     with pytest.raises(ValueError, match="Polygraf call failed with status code 401"):
-        await polygraf_request("John", "http://polygraf.example/pii", None, session=session)
-
-
-class _FakeSessionWithTimeoutKwarg:
-    def __init__(self, response):
-        self.response = response
-        self.timeouts = []
-
-    def post(self, server_endpoint, json, headers, timeout=None):
-        self.timeouts.append(timeout)
-        return _FakePostContextManager(self.response)
+        await polygraf_request("John", "http://polygraf.example/pii", None, http_client=client)
 
 
 @pytest.mark.asyncio
-async def test_polygraf_request_forwards_timeout_to_post():
-    import aiohttp
+async def test_polygraf_request_raises_for_invalid_json():
+    client = RecordingHTTPClient([_http_response(text="not-json")])
 
-    session = _FakeSessionWithTimeoutKwarg(_FakeResponse(payload=[]))
-
-    await polygraf_request("hello", "http://polygraf.example/pii", None, session=session, timeout=7)
-
-    assert isinstance(session.timeouts[0], aiohttp.ClientTimeout)
-    assert session.timeouts[0].total == 7
+    with pytest.raises(ValueError, match="Failed to parse Polygraf response as JSON"):
+        await polygraf_request("John", "http://polygraf.example/pii", None, http_client=client)
 
 
-class _FakeRaisingSession:
-    """Test double whose .post() raises a configurable exception when entered."""
+@pytest.mark.asyncio
+async def test_polygraf_request_forwards_timeout_to_client():
+    client = RecordingHTTPClient([_http_response([])])
 
-    def __init__(self, exc: BaseException):
-        self.exc = exc
+    await polygraf_request("hello", "http://polygraf.example/pii", None, http_client=client, timeout=7)
 
-    def post(self, *args, **kwargs):
-        async def _raise():
-            raise self.exc
-
-        class _Ctx:
-            def __init__(self, raise_fn):
-                self._raise_fn = raise_fn
-
-            async def __aenter__(self_inner):
-                await self_inner._raise_fn()
-
-            async def __aexit__(self_inner, *a):
-                return False
-
-        return _Ctx(_raise)
+    assert client.requests[0].timeout == 7
 
 
 @pytest.mark.asyncio
 async def test_polygraf_request_normalizes_timeout_as_value_error():
-    import asyncio
-
-    session = _FakeRaisingSession(asyncio.TimeoutError())
+    client = RecordingHTTPClient([HTTPTimeoutError("timed out")])
 
     with pytest.raises(ValueError, match="timed out"):
-        await polygraf_request("hello", "http://polygraf.example/pii", None, session=session, timeout=3)
+        await polygraf_request("hello", "http://polygraf.example/pii", None, http_client=client, timeout=3)
 
 
 @pytest.mark.asyncio
 async def test_polygraf_request_normalizes_client_error_as_value_error():
-    import aiohttp
-
-    session = _FakeRaisingSession(aiohttp.ClientConnectionError("dns failure"))
+    client = RecordingHTTPClient([HTTPConnectionError("dns failure")])
 
     with pytest.raises(ValueError, match="Polygraf call failed"):
-        await polygraf_request("hello", "http://polygraf.example/pii", None, session=session)
+        await polygraf_request("hello", "http://polygraf.example/pii", None, http_client=client)
 
 
 def test_polygraf_config_rejects_unknown_keys():
@@ -376,7 +379,7 @@ def test_polygraf_v2_input_flow_passes_actual_user_message_to_action():
     async def fake_polygraf_mask_pii(source: str, text, **kwargs):
         captured["source"] = source
         captured["text"] = text
-        return f"<masked:{text}>"
+        return RailOutcome.transform([(TransformTarget.USER_MESSAGE, f"<masked:{text}>")])
 
     # We use the SHIPPED polygraf flow body verbatim (read from flows.co)
     # and wire it into a v2 input rail using the standard guardrails pattern
@@ -483,7 +486,7 @@ async def test_polygraf_mask_pii_fails_closed_on_malformed_selected_entity(monke
     sensitive_email = "test@gmail.com"
     sensitive_input = f"John lives here. Email: {sensitive_email}"
 
-    async def mock_request(text, server_endpoint, api_key, session=None):
+    async def mock_request(text, server_endpoint, api_key, http_client=None):
         return [
             {"entity_type": "Person", "start": 0, "end": 4},
             # Email is in the configured entities and has malformed offsets ->
@@ -497,9 +500,9 @@ async def test_polygraf_mask_pii_fails_closed_on_malformed_selected_entity(monke
 
     result = await polygraf_mask_pii("input", sensitive_input, _polygraf_config())
 
-    assert result == FAILSAFE_MASK_PLACEHOLDER
+    assert result.transform_text["user_message"] == FAILSAFE_MASK_PLACEHOLDER
     # The original sensitive value must never appear in the returned text.
-    assert sensitive_email not in result
+    assert sensitive_email not in result.transform_text["user_message"]
     # Log warnings must only carry structural metadata, not the PII value.
     assert sensitive_email not in caplog.text
     assert "Skipping malformed Polygraf entity" in caplog.text
@@ -510,7 +513,7 @@ async def test_polygraf_mask_pii_fails_closed_on_malformed_selected_entity(monke
 async def test_polygraf_mask_pii_skips_unselected_malformed_entity(monkeypatch, caplog):
     """A *known-type* malformed entity that does NOT match the entity filter is skipped, not failed."""
 
-    async def mock_request(text, server_endpoint, api_key, session=None):
+    async def mock_request(text, server_endpoint, api_key, http_client=None):
         return [
             {"entity_type": "Person", "start": 0, "end": 4},
             # CreditCard is not in the configured entities for `input`; even though
@@ -524,7 +527,7 @@ async def test_polygraf_mask_pii_skips_unselected_malformed_entity(monkeypatch, 
 
     result = await polygraf_mask_pii("input", "John lives here", _polygraf_config())
 
-    assert result == "<Person> lives here"
+    assert result.transform_text["user_message"] == "<Person> lives here"
 
 
 @pytest.mark.asyncio
@@ -533,7 +536,7 @@ async def test_polygraf_mask_pii_fails_closed_on_missing_entity_type(monkeypatch
 
     sensitive = "John lives here"
 
-    async def mock_request(text, server_endpoint, api_key, session=None):
+    async def mock_request(text, server_endpoint, api_key, http_client=None):
         return [
             {"start": 0, "end": 4, "entity_text": "John"},
         ]
@@ -544,7 +547,7 @@ async def test_polygraf_mask_pii_fails_closed_on_missing_entity_type(monkeypatch
 
     result = await polygraf_mask_pii("input", sensitive, _polygraf_config())
 
-    assert result == FAILSAFE_MASK_PLACEHOLDER
+    assert result.transform_text["user_message"] == FAILSAFE_MASK_PLACEHOLDER
     assert "John" not in caplog.text
 
 
@@ -563,7 +566,7 @@ async def test_polygraf_mask_pii_fails_closed_on_missing_entity_type(monkeypatch
 async def test_polygraf_mask_pii_fails_closed_on_out_of_range_offsets(monkeypatch, bad_offsets):
     """Invalid offsets (bool, negative, reversed, beyond text, empty) must fail closed for a selected entity."""
 
-    async def mock_request(text, server_endpoint, api_key, session=None):
+    async def mock_request(text, server_endpoint, api_key, http_client=None):
         return [{"entity_type": "Person", **bad_offsets}]
 
     monkeypatch.setenv("POLYGRAF_API_KEY", "secret")
@@ -571,14 +574,14 @@ async def test_polygraf_mask_pii_fails_closed_on_out_of_range_offsets(monkeypatc
 
     result = await polygraf_mask_pii("input", "John lives here", _polygraf_config())
 
-    assert result == FAILSAFE_MASK_PLACEHOLDER
+    assert result.transform_text["user_message"] == FAILSAFE_MASK_PLACEHOLDER
 
 
 @pytest.mark.asyncio
 async def test_polygraf_detect_pii_fails_closed_on_missing_entity_type(monkeypatch):
     """detect must block when an entity has no entity_type (cannot prove it's safe)."""
 
-    async def mock_request(text, server_endpoint, api_key, session=None):
+    async def mock_request(text, server_endpoint, api_key, http_client=None):
         return [{"start": 0, "end": 4, "entity_text": "John"}]
 
     monkeypatch.setenv("POLYGRAF_API_KEY", "secret")
@@ -586,7 +589,7 @@ async def test_polygraf_detect_pii_fails_closed_on_missing_entity_type(monkeypat
 
     result = await polygraf_detect_pii("input", "John lives here", _polygraf_config())
 
-    assert result is True
+    assert result.is_blocked
 
 
 @pytest.mark.asyncio
@@ -595,7 +598,7 @@ async def test_polygraf_mask_pii_fails_closed_on_provider_error(monkeypatch, cap
 
     sensitive_text = "John lives at 1 Main St; email test@gmail.com"
 
-    async def mock_request(text, server_endpoint, api_key, session=None):
+    async def mock_request(text, server_endpoint, api_key, http_client=None):
         raise ValueError("Polygraf call timed out after 30 seconds.")
 
     monkeypatch.setenv("POLYGRAF_API_KEY", "secret")
@@ -604,7 +607,7 @@ async def test_polygraf_mask_pii_fails_closed_on_provider_error(monkeypatch, cap
 
     result = await polygraf_mask_pii("input", sensitive_text, _polygraf_config())
 
-    assert result == FAILSAFE_MASK_PLACEHOLDER
+    assert result.transform_text["user_message"] == FAILSAFE_MASK_PLACEHOLDER
     # Even on failure, the caller's text must not leak into logs.
     assert sensitive_text not in caplog.text
     assert "test@gmail.com" not in caplog.text
@@ -615,7 +618,7 @@ async def test_polygraf_mask_pii_fails_closed_on_provider_error(monkeypatch, cap
 async def test_polygraf_detect_pii_fails_closed_on_provider_error(monkeypatch, caplog):
     """A request-layer ValueError must cause detect to block (return True)."""
 
-    async def mock_request(text, server_endpoint, api_key, session=None):
+    async def mock_request(text, server_endpoint, api_key, http_client=None):
         raise ValueError("Polygraf call failed: ClientConnectorError: ...")
 
     monkeypatch.setenv("POLYGRAF_API_KEY", "secret")
@@ -624,7 +627,7 @@ async def test_polygraf_detect_pii_fails_closed_on_provider_error(monkeypatch, c
 
     result = await polygraf_detect_pii("input", "John lives here", _polygraf_config())
 
-    assert result is True
+    assert result.is_blocked
     assert "Polygraf detection failed" in caplog.text
 
 
@@ -632,7 +635,7 @@ async def test_polygraf_detect_pii_fails_closed_on_provider_error(monkeypatch, c
 async def test_polygraf_detect_pii_fails_closed_on_malformed_selected_entity(monkeypatch, caplog):
     """detect must block when a configured entity is reported with bad shape."""
 
-    async def mock_request(text, server_endpoint, api_key, session=None):
+    async def mock_request(text, server_endpoint, api_key, http_client=None):
         return [
             # Email is in the configured filter and missing offsets -> fail closed.
             {"entity_type": "Email"},
@@ -644,13 +647,13 @@ async def test_polygraf_detect_pii_fails_closed_on_malformed_selected_entity(mon
 
     result = await polygraf_detect_pii("input", "Some text", _polygraf_config())
 
-    assert result is True
+    assert result.is_blocked
     assert "Polygraf returned a malformed selected entity" in caplog.text
 
 
 @pytest.mark.asyncio
 async def test_polygraf_actions_warn_when_api_key_missing(monkeypatch, caplog):
-    async def mock_request(text, server_endpoint, api_key, session=None):
+    async def mock_request(text, server_endpoint, api_key, http_client=None):
         assert api_key is None
         return []
 
@@ -660,25 +663,53 @@ async def test_polygraf_actions_warn_when_api_key_missing(monkeypatch, caplog):
 
     result = await polygraf_detect_pii("input", "John", _polygraf_config())
 
-    assert result is False
+    assert not result.is_blocked
     assert "POLYGRAF_API_KEY environment variable is not set" in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_polygraf_mask_pii_accepts_extra_kwargs_and_shared_session(monkeypatch):
-    sentinel_session = object()
+async def test_polygraf_mask_pii_accepts_extra_kwargs_and_shared_client(monkeypatch):
+    sentinel_client = RecordingHTTPClient()
 
-    async def mock_request(text, server_endpoint, api_key, session=None):
+    async def mock_request(text, server_endpoint, api_key, http_client=None):
         assert api_key == "secret"
-        assert session is sentinel_session
+        assert http_client is sentinel_client
         return [{"entity_type": "Person", "entity_text": "John", "start": 0, "end": 4, "score": 0.99}]
 
     monkeypatch.setenv("POLYGRAF_API_KEY", "secret")
     monkeypatch.setattr("nemoguardrails.library.polygraf.actions.polygraf_request", mock_request)
 
-    result = await polygraf_mask_pii("input", "John", _polygraf_config(), session=sentinel_session, extra="ignored")
+    result = await polygraf_mask_pii(
+        "input",
+        "John",
+        _polygraf_config(),
+        http_client=sentinel_client,
+        extra="ignored",
+    )
 
-    assert result == "<Person>"
+    assert result.transform_text["user_message"] == "<Person>"
+
+
+@pytest.mark.asyncio
+async def test_polygraf_detect_pii_forwards_shared_client(monkeypatch):
+    sentinel_client = RecordingHTTPClient()
+
+    async def mock_request(text, server_endpoint, api_key, http_client=None):
+        assert api_key == "secret"
+        assert http_client is sentinel_client
+        return []
+
+    monkeypatch.setenv("POLYGRAF_API_KEY", "secret")
+    monkeypatch.setattr("nemoguardrails.library.polygraf.actions.polygraf_request", mock_request)
+
+    result = await polygraf_detect_pii(
+        "input",
+        "Hello",
+        _polygraf_config(),
+        http_client=sentinel_client,
+    )
+
+    assert not result.is_blocked
 
 
 @pytest.mark.unit
@@ -874,6 +905,69 @@ def test_polygraf_pii_detection_retrieval_with_no_pii():
 
     chat >> "Hi!"
     chat << "Hi! My name is John as well."
+
+
+@pytest.mark.unit
+def test_polygraf_pii_detection_retrieval_with_pii():
+    config = RailsConfig.from_content(
+        yaml_content="""
+            models: []
+            rails:
+              config:
+                polygraf:
+                  server_endpoint: http://localhost:8000/v1/pii/text-detect
+                  retrieval:
+                    entities:
+                      - Email
+                      - Person
+              retrieval:
+                flows:
+                  - polygraf detect pii on retrieval
+        """,
+        colang_content="""
+            define user express greeting
+              "hi"
+
+            define flow
+              user express greeting
+              bot express greeting
+
+            define bot inform answer unknown
+              "I can't answer that."
+        """,
+    )
+
+    chat = TestChat(config, llm_completions=["  express greeting"])
+    retrieved_chunks = iter(
+        [
+            "John's Email: test@gmail.com",
+            "Mock retrieved context.",
+        ]
+    )
+
+    @action()
+    def retrieve_relevant_chunks_with_pii():
+        context_updates = {"relevant_chunks": next(retrieved_chunks)}
+        return ActionResult(
+            return_value=context_updates["relevant_chunks"],
+            context_updates=context_updates,
+        )
+
+    chat.app.register_action(
+        retrieve_relevant_chunks_with_pii,
+        "retrieve_relevant_chunks",
+    )
+    chat.app.register_action(
+        create_mock_polygraf_detect_pii(["Email", "Person"]),
+        "polygraf_detect_pii",
+    )
+    chat.app.register_action(
+        create_mock_polygraf_mask_pii(["Email", "Person"]),
+        "polygraf_mask_pii",
+    )
+
+    chat >> "Hi!"
+    chat << "I can't answer that."
 
 
 @pytest.mark.unit
