@@ -27,14 +27,15 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from nemoguardrails.guardrails import telemetry
-from nemoguardrails.guardrails.api_engine import APIEngine
+from nemoguardrails.guardrails.base_engine import BaseEngine
 from nemoguardrails.guardrails.engine_registry import EngineRegistry
 from nemoguardrails.guardrails.model_engine import ModelEngine
 from nemoguardrails.guardrails.tool_schema import Toolset
+from nemoguardrails.llm.call import llm_call
 from nemoguardrails.rails.llm.config import RailsConfig
 from nemoguardrails.tracing import constants as tracing_constants
 from nemoguardrails.tracing.constants import SystemConstants
-from nemoguardrails.types import LLMResponse, LLMResponseChunk, UsageInfo
+from nemoguardrails.types import LLMModel, LLMResponse, LLMResponseChunk, UsageInfo
 from tests.guardrails.metric_helpers import collect_histogram_sum, collect_metric_points
 from tests.guardrails.test_data import NEMOGUARDS_CONFIG
 
@@ -49,7 +50,7 @@ def rails_config():
 @patch.dict("os.environ", {"NVIDIA_API_KEY": "test-key"})
 def manager(rails_config):
     """Create a EngineRegistry from test config."""
-    return EngineRegistry(rails_config.models, rails_config.rails.config)
+    return EngineRegistry(rails_config.models)
 
 
 @pytest.fixture(autouse=True)
@@ -88,7 +89,7 @@ def metric_reader():
 @patch.dict("os.environ", {"NVIDIA_API_KEY": "test-key"})
 def manager_with_metrics(rails_config):
     """Create an EngineRegistry with metrics emission enabled."""
-    return EngineRegistry(rails_config.models, rails_config.rails.config, metrics_enabled=True)
+    return EngineRegistry(rails_config.models, metrics_enabled=True)
 
 
 @pytest.fixture
@@ -110,7 +111,7 @@ def manager_with_tracer(rails_config, span_exporter):
     """Create an EngineRegistry wired to the test tracer (metrics + content
     capture off) so LLM calls produce real spans we can read back."""
     tracer, _ = span_exporter
-    return EngineRegistry(rails_config.models, rails_config.rails.config, tracer=tracer)
+    return EngineRegistry(rails_config.models, tracer=tracer)
 
 
 def _mock_stream(*chunks: LLMResponseChunk, error: Optional[Exception] = None):
@@ -174,46 +175,27 @@ def _registry_with_main_params(parameters: dict, tracer):
             ]
         }
     )
-    return EngineRegistry(config.models, config.rails.config, tracer=tracer)
+    return EngineRegistry(config.models, tracer=tracer)
 
 
 class TestEngineRegistryInit:
     """Test EngineRegistry creates engines from config."""
 
     def test_create_engines_for_each_model_type(self, manager):
-        """Creates one engine per model type in config, plus API engines."""
+        """Creates one engine per model type in config."""
         engine_names = set(manager._engines.keys())
-        assert {"main", "content_safety", "topic_control", "jailbreak_detection"} == engine_names
+        assert {"main", "content_safety", "topic_control"} == engine_names
 
     @patch.dict("os.environ", {"NVIDIA_API_KEY": "test-key"})
     def test_empty_config_creates_no_engines(self):
         """Empty models list results in no engines."""
         config = RailsConfig.from_content(config={"models": []})
-        mgr = EngineRegistry(config.models, config.rails.config)
+        mgr = EngineRegistry(config.models)
         assert len(mgr._engines) == 0
 
-    @patch.dict("os.environ", {"NVIDIA_API_KEY": "test-key"})
-    def test_model_type_collision_with_api_engine_raises(self):
-        """Raises ValueError when a model type collides with an API engine name."""
-        config = RailsConfig.from_content(
-            config={
-                "models": [
-                    {"type": "main", "engine": "nim", "model": "meta/llama-3.3-70b-instruct"},
-                    {"type": "jailbreak_detection", "engine": "nim", "model": "some/model"},
-                ],
-                "rails": {
-                    "config": {
-                        "jailbreak_detection": {
-                            "nim_base_url": "https://ai.api.nvidia.com",
-                            "nim_server_endpoint": "/v1/security/nvidia/nemoguard-jailbreak-detect",
-                            "api_key_env_var": "NVIDIA_API_KEY",
-                        }
-                    }
-                },
-            }
-        )
-        with pytest.raises(ValueError, match="already registered"):
-            EngineRegistry(config.models, config.rails.config)
+    def test_jailbreak_detection_config_registers_no_engine(self, manager):
+        """The jailbreak rail reaches its NIM over HTTP, so the registry holds no engine for it."""
+        assert "jailbreak_detection" not in manager._engines
 
 
 class TestEngineRegistryGetModelEngine:
@@ -242,9 +224,12 @@ class TestEngineRegistryGetModelEngine:
         assert "main" in str(exc_info.value)
 
     def test_wrong_type_raises_type_error(self, manager):
-        """Raises TypeError when engine exists but is the wrong type."""
-        with pytest.raises(TypeError, match="Engine 'jailbreak_detection' is APIEngine, expected ModelEngine"):
-            manager._get_engine("jailbreak_detection", ModelEngine)
+        """Raises TypeError when the named engine is not the expected type."""
+        # Every engine the registry builds is a ModelEngine now that APIEngine is gone, so the
+        # type check is only reachable by planting one -- and it still guards model_call.
+        manager._engines["not_a_model"] = BaseEngine()
+        with pytest.raises(TypeError, match="Engine 'not_a_model' is BaseEngine, expected ModelEngine"):
+            manager._get_engine("not_a_model", ModelEngine)
 
 
 class TestEngineRegistryLifecycle:
@@ -720,7 +705,7 @@ class TestEngineRegistryStartErrors:
     @pytest.mark.asyncio
     async def test_start_rolls_back_on_engine_failure(self, manager):
         """When one engine fails to start, already-started engines are stopped."""
-        failing_engine = "jailbreak_detection"
+        failing_engine = "topic_control"
 
         for name, engine in manager._engines.items():
             if name == failing_engine:
@@ -759,7 +744,7 @@ class TestEngineRegistryStartErrors:
     @pytest.mark.asyncio
     async def test_start_rollback_swallows_stop_errors(self, manager):
         """Rollback continues even if stopping a started engine raises."""
-        failing_engine = "jailbreak_detection"
+        failing_engine = "topic_control"
         stop_error_engine = "main"
 
         for name, engine in manager._engines.items():
@@ -857,136 +842,6 @@ class TestEngineRegistryContextManager:
 
         for engine in manager._engines.values():
             engine.stop.assert_called_once()
-
-
-class TestEngineRegistryGetApiEngine:
-    """Test API engine lookup by name."""
-
-    def test_get_existing_api_engine(self, manager):
-        """Returns the jailbreak detection API engine."""
-        api_engine = manager._get_engine("jailbreak_detection", APIEngine)
-        assert api_engine is not None
-        assert "jailbreak" in api_engine.url
-
-    def test_get_missing_api_engine_raises_key_error(self, manager):
-        """Raises KeyError for an unconfigured API engine name."""
-        with pytest.raises(KeyError, match="No engine configured with name 'nonexistent'"):
-            manager._get_engine("nonexistent", APIEngine)
-
-    def test_key_error_message_lists_available_engines(self, manager):
-        """KeyError message includes available API engine names."""
-        with pytest.raises(KeyError) as exc_info:
-            manager._get_engine("missing", APIEngine)
-        assert "jailbreak_detection" in str(exc_info.value)
-
-
-class TestEngineRegistryApiCall:
-    """Test api_call routes to the correct API engine."""
-
-    @pytest.mark.asyncio
-    async def test_calls_correct_api_engine(self, manager):
-        """api_call delegates to the named API engine and returns its response."""
-        api_engine = manager._get_engine("jailbreak_detection", APIEngine)
-        mock_response = {"jailbreak": False, "score": -0.95}
-        api_engine.call = AsyncMock(return_value=mock_response)
-
-        result = await manager.api_call("jailbreak_detection", {"input": "hello"})
-
-        assert result == mock_response
-        api_engine.call.assert_called_once_with({"input": "hello"})
-
-    @pytest.mark.asyncio
-    async def test_passes_kwargs_to_api_engine(self, manager):
-        """Extra kwargs are forwarded to the API engine's call()."""
-        api_engine = manager._get_engine("jailbreak_detection", APIEngine)
-        api_engine.call = AsyncMock(return_value={"jailbreak": False, "score": -0.80})
-
-        await manager.api_call("jailbreak_detection", {"input": "test"}, extra_param="value")
-
-        api_engine.call.assert_called_once_with({"input": "test"}, extra_param="value")
-
-    @pytest.mark.asyncio
-    async def test_raises_key_error_for_unknown_api_name(self, manager):
-        """Raises KeyError when the API engine name doesn't exist."""
-        with pytest.raises(KeyError):
-            await manager.api_call("nonexistent", {"input": "test"})
-
-
-class TestEngineRegistryApiEngineStartErrors:
-    """Test start() error handling for API engines."""
-
-    @pytest.mark.asyncio
-    async def test_start_rolls_back_on_api_engine_failure(self, manager):
-        """When an API engine fails to start, all started engines are rolled back."""
-        # Mock all engines to succeed
-        for engine in manager._engines.values():
-            engine.start = AsyncMock()
-            engine.stop = AsyncMock()
-
-        # Override jailbreak API engine to fail
-        api_engine = manager._get_engine("jailbreak_detection", APIEngine)
-        api_engine.start = AsyncMock(side_effect=RuntimeError("API unreachable"))
-        api_engine.stop = AsyncMock()
-
-        with pytest.raises(RuntimeError, match="Failed to start engine"):
-            await manager.start()
-
-        # Engines that started successfully should have been rolled back
-        for name, engine in manager._engines.items():
-            if name != "jailbreak_detection":
-                engine.stop.assert_called_once()
-
-        assert not manager._running
-
-    @pytest.mark.asyncio
-    async def test_start_error_message_includes_api_engine_name(self, manager):
-        """Error message includes which API engine failed to start."""
-        for engine in manager._engines.values():
-            engine.start = AsyncMock()
-            engine.stop = AsyncMock()
-
-        api_engine = manager._get_engine("jailbreak_detection", APIEngine)
-        api_engine.start = AsyncMock(side_effect=RuntimeError("timeout"))
-        api_engine.stop = AsyncMock()
-
-        with pytest.raises(RuntimeError, match="Engine jailbreak_detection"):
-            await manager.start()
-
-
-class TestEngineRegistryApiEngineStopErrors:
-    """Test stop() error handling for API engines."""
-
-    @pytest.mark.asyncio
-    async def test_stop_raises_on_api_engine_error(self, manager):
-        """stop() raises RuntimeError when an API engine fails to stop."""
-        for engine in manager._engines.values():
-            engine.start = AsyncMock()
-            engine.stop = AsyncMock()
-
-        api_engine = manager._get_engine("jailbreak_detection", APIEngine)
-        api_engine.start = AsyncMock()
-        api_engine.stop = AsyncMock(side_effect=RuntimeError("close failed"))
-
-        await manager.start()
-
-        with pytest.raises(RuntimeError, match="Failed to stop engines"):
-            await manager.stop()
-
-    @pytest.mark.asyncio
-    async def test_stop_error_includes_api_engine_name(self, manager):
-        """Error message includes which API engine failed to stop."""
-        for engine in manager._engines.values():
-            engine.start = AsyncMock()
-            engine.stop = AsyncMock()
-
-        api_engine = manager._get_engine("jailbreak_detection", APIEngine)
-        api_engine.start = AsyncMock()
-        api_engine.stop = AsyncMock(side_effect=RuntimeError("timeout"))
-
-        await manager.start()
-
-        with pytest.raises(RuntimeError, match="Engine jailbreak_detection"):
-            await manager.stop()
 
 
 class TestEngineRegistryStreamModelCall:
@@ -1137,7 +992,13 @@ class TestEngineRegistryStreamModelCallMetrics:
         ``record_token_usage`` line after the ``with`` block doesn't
         run (GeneratorExit unwinds the with-stack but skips trailing
         code).  Duration still records via the ``finally`` in
-        ``llm_operation_duration``."""
+        ``llm_operation_duration``.
+
+        This also pins ``stream_model_call``'s ``finally: await stream.aclose()``.
+        The metric context lives one generator down, in
+        ``ModelEngine.stream_from_messages``; closing this generator only unwinds
+        this one, so without that explicit close the delegate stays suspended at
+        its yield and the duration is not recorded until garbage collection."""
         engine = manager_with_metrics._get_engine("main", ModelEngine)
         engine.stream_chat_completion = _mock_stream(
             LLMResponseChunk(delta_content="Hello"),
@@ -1560,9 +1421,10 @@ class TestEngineRegistryToolDelegation:
             manager.extract_tool_exchanges("nonexistent", [])
 
     def test_parse_tools_non_model_engine_raises_typeerror(self, manager):
-        """jailbreak_detection is an APIEngine, not a ModelEngine."""
+        """Tool parsing needs a ModelEngine, and says so rather than failing on a missing method."""
+        manager._engines["not_a_model"] = BaseEngine()
         with pytest.raises(TypeError):
-            manager.parse_tools("jailbreak_detection", {"tools": self._TOOLS})
+            manager.parse_tools("not_a_model", {"tools": self._TOOLS})
 
     def test_parse_tools_includes_tools_from_model_parameters(self):
         """Tools declared in model parameters (body_param_defaults) are included even with no per-call llm_params."""
@@ -1579,6 +1441,253 @@ class TestEngineRegistryToolDelegation:
             }
         )
         with patch.dict("os.environ", {"NVIDIA_API_KEY": "test-key"}):
-            mgr = EngineRegistry(config.models, config.rails.config)
+            mgr = EngineRegistry(config.models)
         toolset = mgr.parse_tools("main", None)
         assert [t.key for t in toolset.tools] == ["get_weather"]
+
+
+class TestEngineRegistryLLMs:
+    """``llms`` exposes the model engines as the ``Dict[str, LLMModel]`` that library
+    rail actions index by model type."""
+
+    def test_maps_every_model_type(self, manager):
+        """One entry per configured model, keyed by Model.type."""
+        assert set(manager.llms) == {"main", "content_safety", "topic_control"}
+
+    def test_values_are_the_registered_engines(self, manager):
+        """Entries are the registry's own engines, not copies, so they share lifecycle."""
+        assert manager.llms["main"] is manager._get_engine("main", ModelEngine)
+
+    def test_values_satisfy_the_llm_model_protocol(self, manager):
+        """Every entry is usable wherever a library action declares ``LLMModel``."""
+        assert all(isinstance(model, LLMModel) for model in manager.llms.values())
+
+
+class TestEngineRegistryMessagesEntryPoint:
+    """The registry always holds wire messages — every IORails entry point normalizes
+    through ``IORails._convert_to_messages`` — so it calls the messages-typed core
+    directly instead of routing back through the ``LLMModel`` prompt adapter."""
+
+    _MESSAGES = [{"role": "user", "content": "Hi"}]
+
+    @pytest.mark.asyncio
+    async def test_model_call_skips_the_prompt_adapter(self, manager):
+        """model_call reaches generate_from_messages with its messages and kwargs intact."""
+        engine = manager._get_engine("main", ModelEngine)
+        engine.generate_from_messages = AsyncMock(return_value=LLMResponse(content="ok"))
+
+        await manager.model_call("main", self._MESSAGES, temperature=0.5)
+
+        engine.generate_from_messages.assert_called_once_with(self._MESSAGES, temperature=0.5)
+
+    @pytest.mark.asyncio
+    async def test_stream_model_call_skips_the_prompt_adapter(self, manager):
+        """stream_model_call reaches stream_from_messages and yields its chunks."""
+        engine = manager._get_engine("main", ModelEngine)
+        captured = {}
+
+        async def _fake_stream(messages, **kwargs):
+            captured["messages"] = messages
+            captured["kwargs"] = kwargs
+            yield LLMResponseChunk(delta_content="ok")
+
+        engine.stream_from_messages = _fake_stream
+
+        chunks = [chunk async for chunk in manager.stream_model_call("main", self._MESSAGES, temperature=0.5)]
+
+        assert captured == {"messages": self._MESSAGES, "kwargs": {"temperature": 0.5}}
+        assert [chunk.delta_content for chunk in chunks] == ["ok"]
+
+
+class TestEngineRegistryProviderName:
+    """``provider_name`` reads the engine's own property rather than its model config."""
+
+    def test_returns_the_engine_provider_name(self, manager):
+        """The registry and the engine agree on the provider name."""
+        engine = manager._get_engine("main", ModelEngine)
+        assert manager.provider_name("main") == engine.provider_name == "nim"
+
+    def test_unknown_model_type_raises_key_error(self, manager):
+        """An unconfigured model type raises rather than reporting 'unknown'."""
+        with pytest.raises(KeyError):
+            manager.provider_name("nonexistent")
+
+
+class TestRailCallTelemetryParity:
+    """A rail-shaped ``llm_call(engine, ...)`` produces the same telemetry as
+    ``EngineRegistry.model_call``.
+
+    Library rail actions reach the model through ``llm_call`` -> ``generate_async``,
+    not through ``model_call``. If the LLM span and the GenAI metrics stayed in the
+    registry wrapper, every migrated rail would silently stop emitting them — no
+    error, no failing test, just missing telemetry in production. These tests pin the
+    instrumentation to the engine so both entry points stay equivalent.
+    """
+
+    _MESSAGES = [{"role": "user", "content": "Is this safe?"}]
+
+    @staticmethod
+    def _response() -> LLMResponse:
+        return LLMResponse(
+            content="safe",
+            model="meta/llama-3.3-70b-instruct",
+            finish_reason="stop",
+            request_id="chatcmpl-1",
+            usage=UsageInfo(input_tokens=10, output_tokens=5, total_tokens=15),
+        )
+
+    @pytest.mark.asyncio
+    async def test_span_matches_model_call(self, manager_with_tracer, span_exporter, reset_llm_call_context):
+        """Both entry points emit one LLM CLIENT span with identical name, kind, and attributes."""
+        _, exporter = span_exporter
+        engine = manager_with_tracer._get_engine("main", ModelEngine)
+        engine.chat_completion = AsyncMock(return_value=self._response())
+
+        await manager_with_tracer.model_call("main", self._MESSAGES, temperature=0.2, stop=["END"])
+        registry_span = exporter.get_finished_spans()[-1]
+        exporter.clear()
+
+        await llm_call(engine, self._MESSAGES, stop=["END"], llm_params={"temperature": 0.2})
+        rail_span = exporter.get_finished_spans()[-1]
+
+        assert rail_span.name == registry_span.name
+        assert rail_span.kind == registry_span.kind
+        assert dict(rail_span.attributes) == dict(registry_span.attributes)
+
+    @pytest.mark.asyncio
+    async def test_error_span_matches_model_call(self, manager_with_tracer, span_exporter, reset_llm_call_context):
+        """A provider failure marks the span the same way on both paths."""
+        _, exporter = span_exporter
+        engine = manager_with_tracer._get_engine("main", ModelEngine)
+        engine.chat_completion = AsyncMock(side_effect=RuntimeError("provider down"))
+
+        with pytest.raises(RuntimeError, match="provider down"):
+            await manager_with_tracer.model_call("main", self._MESSAGES)
+        registry_span = exporter.get_finished_spans()[-1]
+        exporter.clear()
+
+        with pytest.raises(Exception, match="provider down"):
+            await llm_call(engine, self._MESSAGES)
+        rail_span = exporter.get_finished_spans()[-1]
+
+        assert rail_span.status.status_code == registry_span.status.status_code
+        assert dict(rail_span.attributes)["error.type"] == dict(registry_span.attributes)["error.type"]
+
+    @pytest.mark.asyncio
+    async def test_content_capture_matches_model_call(self, rails_config, span_exporter, reset_llm_call_context):
+        """With capture on, the rail path records the same message content."""
+        tracer, exporter = span_exporter
+        with patch.dict("os.environ", {"NVIDIA_API_KEY": "test-key"}):
+            registry = EngineRegistry(
+                rails_config.models,
+                tracer=tracer,
+                content_capture_enabled=True,
+            )
+        engine = registry._get_engine("main", ModelEngine)
+        engine.chat_completion = AsyncMock(return_value=self._response())
+
+        await registry.model_call("main", self._MESSAGES)
+        registry_attrs = dict(exporter.get_finished_spans()[-1].attributes)
+        exporter.clear()
+
+        await llm_call(engine, self._MESSAGES)
+        rail_attrs = dict(exporter.get_finished_spans()[-1].attributes)
+
+        assert rail_attrs == registry_attrs
+
+    @pytest.mark.asyncio
+    async def test_rail_call_emits_token_usage_and_duration(
+        self, manager_with_metrics, metric_reader, reset_llm_call_context
+    ):
+        """The GenAI metrics fire on the rail path, labelled by model, provider, and operation."""
+        engine = manager_with_metrics._get_engine("main", ModelEngine)
+        engine.chat_completion = AsyncMock(return_value=self._response())
+
+        await llm_call(engine, self._MESSAGES)
+
+        points = collect_metric_points(metric_reader)
+        assert {p.attributes["gen_ai.token.type"] for p in points["gen_ai.client.token.usage"]} == {"input", "output"}
+        assert points["gen_ai.client.operation.duration"][0].value == 1
+        for point in points["gen_ai.client.token.usage"] + points["gen_ai.client.operation.duration"]:
+            assert point.attributes["gen_ai.operation.name"] == "chat"
+            assert point.attributes["gen_ai.provider.name"] == "nim"
+            assert point.attributes["gen_ai.request.model"] == "meta/llama-3.3-70b-instruct"
+
+    @pytest.mark.asyncio
+    async def test_rail_call_records_error_type_on_failure(
+        self, manager_with_metrics, metric_reader, reset_llm_call_context
+    ):
+        """A failed rail call still emits duration, labelled with the failure type."""
+        engine = manager_with_metrics._get_engine("main", ModelEngine)
+        engine.chat_completion = AsyncMock(side_effect=RuntimeError("provider down"))
+
+        with pytest.raises(Exception, match="provider down"):
+            await llm_call(engine, self._MESSAGES)
+
+        points = collect_metric_points(metric_reader)
+        assert "gen_ai.client.token.usage" not in points
+        assert points["gen_ai.client.operation.duration"][0].attributes["error.type"] == "RuntimeError"
+
+    @pytest.mark.asyncio
+    async def test_no_metrics_when_metrics_disabled(self, manager, metric_reader, reset_llm_call_context):
+        """Metrics stay gated on the config flag, not on meter availability."""
+        engine = manager._get_engine("main", ModelEngine)
+        engine.chat_completion = AsyncMock(return_value=self._response())
+
+        await llm_call(engine, self._MESSAGES)
+
+        points = collect_metric_points(metric_reader)
+        assert "gen_ai.client.token.usage" not in points
+        assert "gen_ai.client.operation.duration" not in points
+
+    @pytest.mark.asyncio
+    async def test_stream_duration_recorded_on_consumer_early_break(self, manager_with_metrics, metric_reader):
+        """Abandoning ``stream_async`` mid-stream must still record the duration.
+
+        The adapter and the instrumented core are separate generators, so closing
+        the adapter only unwinds the adapter — it has to close the core too, or
+        the metric's ``finally`` waits on garbage collection.
+        """
+        engine = manager_with_metrics._get_engine("main", ModelEngine)
+        engine.stream_chat_completion = _mock_stream(
+            LLMResponseChunk(delta_content="sa"),
+            LLMResponseChunk(delta_content="fe"),
+            LLMResponseChunk(usage=UsageInfo(input_tokens=10, output_tokens=5)),
+        )
+
+        stream = engine.stream_async(self._MESSAGES)
+        first = await anext(stream)
+        assert first.delta_content == "sa"
+        await stream.aclose()
+
+        points = collect_metric_points(metric_reader)
+        assert "gen_ai.client.token.usage" not in points
+        assert points["gen_ai.client.operation.duration"][0].value == 1
+
+    @pytest.mark.asyncio
+    async def test_stream_span_matches_stream_model_call(self, manager_with_tracer, span_exporter):
+        """The streaming rail path emits the same span as ``stream_model_call``."""
+        _, exporter = span_exporter
+        engine = manager_with_tracer._get_engine("main", ModelEngine)
+        chunks = (
+            LLMResponseChunk(delta_content="sa", model="meta/llama-3.3-70b-instruct", request_id="chatcmpl-1"),
+            LLMResponseChunk(
+                delta_content="fe",
+                finish_reason="stop",
+                usage=UsageInfo(input_tokens=10, output_tokens=5),
+            ),
+        )
+
+        engine.stream_chat_completion = _mock_stream(*chunks)
+        async for _ in manager_with_tracer.stream_model_call("main", self._MESSAGES, temperature=0.2):
+            pass
+        registry_span = exporter.get_finished_spans()[-1]
+        exporter.clear()
+
+        engine.stream_chat_completion = _mock_stream(*chunks)
+        async for _ in engine.stream_async(self._MESSAGES, temperature=0.2):
+            pass
+        rail_span = exporter.get_finished_spans()[-1]
+
+        assert rail_span.name == registry_span.name
+        assert dict(rail_span.attributes) == dict(registry_span.attributes)

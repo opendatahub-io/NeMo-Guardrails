@@ -16,12 +16,12 @@
 """OpenAI API schema definitions for the NeMo Guardrails server."""
 
 import os
-from typing import Any, List, Literal, Optional, Union
+from typing import Annotated, Any, List, Literal, Optional, Union
 
 from openai.types.chat.chat_completion import ChatCompletion
-from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
-from nemoguardrails.rails.llm.options import GenerationOptions
+from nemoguardrails.rails.llm.options import GenerationOptions, RailType
 
 
 class GuardrailsDataOutput(BaseModel):
@@ -43,10 +43,30 @@ class GuardrailsChatCompletion(ChatCompletion):
     guardrails: Optional[GuardrailsDataOutput] = Field(default=None, description="Guardrails specific output data.")
 
 
+class _OpenAIChatMessageSchema(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    role: str
+
+
+def _validate_openai_chat_message(message: Any) -> Any:
+    _OpenAIChatMessageSchema.model_validate(message)
+    return message
+
+
+OpenAIChatMessage = Annotated[
+    dict[str, Any],
+    BeforeValidator(
+        _validate_openai_chat_message,
+        json_schema_input_type=_OpenAIChatMessageSchema,
+    ),
+]
+
+
 class OpenAIChatCompletionRequest(BaseModel):
     """Standard OpenAI chat completion request parameters."""
 
-    messages: Optional[List[dict]] = Field(
+    messages: Optional[List[OpenAIChatMessage]] = Field(
         default=None,
         description="The list of messages in the current conversation.",
     )
@@ -182,20 +202,12 @@ class OpenAIModelsList(BaseModel):
 
 
 class GuardrailCheckDataInput(GuardrailsDataInput):
-    """Guardrails input options specific to the checks endpoint."""
+    """Guardrails input options specific to the /v1/checks endpoint."""
 
-    config: Optional[Union[str, dict]] = Field(
+    rail_types: Optional[List[RailType]] = Field(
         default=None,
-        description="The id of the configuration or its dict representation to be used.",
+        description="Rail types to run. When omitted, auto-detected from message roles.",
     )
-
-    @model_validator(mode="before")
-    @classmethod
-    def validate_config_exclusivity(cls, data: Any) -> Any:
-        if isinstance(data, dict) and data.get("config") is not None:
-            if data.get("config_id") is not None or data.get("config_ids") is not None:
-                raise ValueError("config is mutually exclusive with config_id and config_ids")
-        return data
 
 
 class GuardrailCheckRequest(OpenAIChatCompletionRequest):
