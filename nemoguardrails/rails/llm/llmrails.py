@@ -64,11 +64,6 @@ from nemoguardrails.context import (
     raw_llm_request,
     streaming_handler_var,
 )
-from nemoguardrails.header_forwarding import (
-    ensure_api_key_for_forwarding,
-    needs_runtime_auth,
-    set_llm_needs_runtime_auth,
-)
 from nemoguardrails.embeddings.index import EmbeddingsIndex
 from nemoguardrails.embeddings.providers import register_embedding_provider
 from nemoguardrails.embeddings.providers.base import EmbeddingModel
@@ -78,6 +73,11 @@ from nemoguardrails.exceptions import (
     InvalidStateError,
     RailTypeNotConfiguredError,
     StreamingNotSupportedError,
+)
+from nemoguardrails.header_forwarding import (
+    ensure_api_key_for_forwarding,
+    needs_runtime_auth,
+    set_llm_needs_runtime_auth,
 )
 from nemoguardrails.kb.kb import KnowledgeBase
 from nemoguardrails.llm.cache import CacheInterface, LFUCache
