@@ -114,7 +114,7 @@ jobs:
         run: uv run pip install bandit[sarif]
 
       - name: Run Bandit Security Scan
-        uses: PyCQA/bandit-action@v1
+        uses: PyCQA/bandit-action@67a458d90fa11fb1463e91e7f4c8f068b5863c7f # v1.0.1
         with:
           targets: "."
           exclude: "tests"
