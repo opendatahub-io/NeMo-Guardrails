@@ -18,8 +18,8 @@ RUN dnf install -y --nodocs --setopt=install_weak_deps=False \
 COPY requirements.txt pyproject.toml README.md LICENSE.md LICENSE-Apache-2.0.txt LICENCES-3rd-party ./
 COPY nemoguardrails/ ./nemoguardrails/
 COPY scripts/ ./scripts/
+COPY scripts/tldcache/ /app/.cache/tldcache/
 COPY examples/bots/ ./examples/bots/
-
 RUN chmod +x ./scripts/entrypoint.sh
 RUN python3 ./scripts/filter_guardrails.py ./scripts/provider-list.yaml $GUARDRAILS_PROFILE
 
@@ -69,6 +69,7 @@ ENV HF_HOME=/app/.cache/huggingface \
     SENTENCE_TRANSFORMERS_HOME=/app/.cache/sentence_transformers \
     NLTK_DATA=/app/.cache/nltk_data \
     FASTEMBED_CACHE_PATH=/app/.cache/fastembed \
+    TLDEXTRACT_CACHE=/app/.cache/tldcache/ \
     PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
