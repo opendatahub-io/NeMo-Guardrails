@@ -1,5 +1,5 @@
 pull_request_rules:
-  - name: Backport merged PRs from develop → incubation (skip .tekton-only changes)
+  - name: Backport merged PRs from develop → stable (skip .tekton-only changes)
     conditions:
       - base=develop
       - merged
@@ -9,31 +9,12 @@ pull_request_rules:
     actions:
       backport:
         branches:
-          - incubation
-        ignore_conflicts: true
-        labels:
-          - bot/sync-incubation
-        title: "[incubation] {{ title }}"
-        body: |
-          Backport of #{{ number }} — {{ title }}
-
-          This PR cherry-picks the changes from `develop` into `incubation`.
-
-  - name: Backport merged PRs from incubation → stable (skip .tekton-only changes)
-    conditions:
-      - base=incubation
-      - merged
-      - repository-full-name=opendatahub-io/NeMo-Guardrails
-      - files~=^(?!\.tekton/).+
-    actions:
-      backport:
-        branches:
           - stable
         ignore_conflicts: true
         labels:
           - bot/sync-stable
-        title: "[stable] {{ title | replace('[incubation] ', '') | replace('Backport to incubation: ', '') | replace('Backport to incubation:', '') }}"
+        title: "[stable] {{ title }}"
         body: |
           Backport of #{{ number }} — {{ title }}
 
-          This PR cherry-picks the changes from `incubation` into `stable`.
+          This PR cherry-picks the changes from `develop` into `stable`.
