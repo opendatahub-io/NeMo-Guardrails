@@ -13,7 +13,7 @@
 [![Downloads](https://static.pepy.tech/badge/nemoguardrails)](https://pepy.tech/project/nemoguardrails)
 [![Downloads](https://static.pepy.tech/badge/nemoguardrails/month)](https://pepy.tech/project/nemoguardrails)
 
-> **LATEST RELEASE / DEVELOPMENT VERSION**: The [develop](https://github.com/NVIDIA-NeMo/Guardrails/tree/develop) branch tracks the latest top of tree development. The latest released version is [0.23.0](https://github.com/NVIDIA-NeMo/Guardrails/tree/v0.23.0).
+> **LATEST RELEASE / DEVELOPMENT VERSION**: The [develop](https://github.com/NVIDIA-NeMo/Guardrails/tree/develop) branch tracks the latest top of tree development. The latest released version is [0.24.1](https://github.com/NVIDIA-NeMo/Guardrails/tree/v0.24.1).
 
 ✨✨✨
 
@@ -27,7 +27,10 @@ NVIDIA NeMo Guardrails library is an open-source toolkit for easily adding *prog
 
 ## Requirements
 
-Python 3.10, 3.11, 3.12 or 3.13.
+Python 3.11, 3.12 or 3.13.
+
+Starting with version 0.25.0, Python 3.10 is no longer supported. Upgrade your
+Python environment before upgrading the library.
 
 ## Installation
 
@@ -154,7 +157,7 @@ Below is an example `config.yml`:
 models:
   - type: main
     engine: openai
-    model: gpt-3.5-turbo-instruct
+    model: gpt-4o-mini
 
 rails:
   # Input rails are invoked when new input from the user is received.
@@ -328,7 +331,7 @@ The telemetry includes:
 - Installed library version, Python version, operating system, and platform string
 - Colang configuration language version (1.0 or 2.x)
 - Names of configured LLM engine providers, such as `openai`, `nim`, or `nvidia_ai_endpoints`, never model names or credentials
-- Counts of configured rail flows for input, output, retrieval, tool input, and tool output rails, plus which rail categories are active
+- Counts of configured rail flows for input, output, retrieval, tool call, and tool result rails, plus which rail categories are active
 - Names of built-in library features that are active, such as `jailbreak_detection`, `content_safety`, or `topic_safety`
 - Count of user-defined Colang flows (count only, never flow names or contents)
 - Whether tracing, streaming, or a knowledge base is configured
