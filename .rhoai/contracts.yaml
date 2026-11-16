@@ -1,0 +1,38 @@
+apiVersion: contracts.rhoai.io/v1alpha1
+kind: ContractSet
+metadata:
+  name: nemo-guardrails
+spec:
+  baseline:
+    refs: ["5dadfe885adc9e698e9731c2919c947b05baac5f"]
+
+  contracts:
+    - id: guardrails-api-v1
+      type: openapi
+      declaredArtifact: fern/openapi.yml
+      matchPath: "^/(v1|healthz)(/|$)"
+      generator:
+        adapter: openapi.static
+        source: fern/openapi.yml
+      policy:
+        oasdiffVersion: "1.33.0"
+        yqVersion: "4.45.1"
+        flattenAllOf: true
+
+    - id: guardrails-hooks-api-v1
+      type: openapi
+      declaredArtifact: fern/hooks-openapi.yml
+      matchPath: "^/(v1|healthz)(/|$)"
+      generator:
+        adapter: openapi.static
+        source: fern/hooks-openapi.yml
+      policy:
+        oasdiffVersion: "1.33.0"
+        yqVersion: "4.45.1"
+        flattenAllOf: true
+
+  exclusions:
+    - path: tests/server/experimental/conformance/openai/chat_completions/fixtures/pinned.openapi.yaml
+      reason: Pinned upstream conformance fixture, not an API served by this repository
+    - path: tests/server/experimental/conformance/openai/litellm/fixtures/response.openapi.json
+      reason: Recorded LiteLLM response fixture, not an API served by this repository

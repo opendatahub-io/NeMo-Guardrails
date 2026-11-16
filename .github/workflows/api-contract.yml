@@ -1,0 +1,41 @@
+name: API contract
+
+on:
+  pull_request:
+    branches: [develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  api-contract:
+    strategy:
+      fail-fast: false
+      matrix:
+        contract-id:
+          - guardrails-api-v1
+          - guardrails-hooks-api-v1
+    # contract-tests v2.2.0 (latest release at onboarding)
+    uses: red-hat-data-services/contract-tests/.github/workflows/provider-openapi-check.yml@d63fe27957117fd99161a693c7fdef9e20efb9d9
+    with:
+      contract-set: .rhoai/contracts.yaml
+      contract-id: ${{ matrix.contract-id }}
+      # Baseline ref: v0.25.0.rc1+rhaiv.1, resolved to full SHA
+      # 5dadfe885adc9e698e9731c2919c947b05baac5f. On pull requests, compare
+      # against the default-branch base commit instead.
+      baseline-refs: ${{ github.event.pull_request.base.sha || '5dadfe885adc9e698e9731c2919c947b05baac5f' }}
+      oasdiff-version: "1.33.0"
+      yq-version: "4.45.1"
+      mode: enforce
+
+  api-contract-coverage:
+    # contract-tests v2.2.0 (latest release at onboarding)
+    uses: red-hat-data-services/contract-tests/.github/workflows/provider-coverage-check.yml@d63fe27957117fd99161a693c7fdef9e20efb9d9
+    with:
+      contract-set: .rhoai/contracts.yaml
+      # Baseline ref: v0.25.0.rc1+rhaiv.1, resolved to full SHA
+      # 5dadfe885adc9e698e9731c2919c947b05baac5f.
+      baseline-refs: ${{ github.event.pull_request.base.sha || '5dadfe885adc9e698e9731c2919c947b05baac5f' }}
+      yq-version: "4.45.1"
+      mode: enforce
