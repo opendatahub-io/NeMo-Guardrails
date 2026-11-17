@@ -42,14 +42,14 @@ runpy.run_path(sys.argv[0], run_name="__main__")
 """
 
 
-def run_export(output: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def run_export(output: Path, *args: str, script: Path = SCRIPT) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     for key in ("OPENAI_API_KEY", "NVIDIA_API_KEY", "NVIDIA_INFERENCE_KEY"):
         env.pop(key, None)
     # The script must produce the same contract even when chat UI is enabled.
     env["NEMO_GUARDRAILS_DISABLE_CHAT_UI"] = "false"
     return subprocess.run(
-        [sys.executable, "-c", OFFLINE_RUNNER, str(SCRIPT), "--output", str(output), *args],
+        [sys.executable, "-c", OFFLINE_RUNNER, str(script), "--output", str(output), *args],
         env=env,
         capture_output=True,
         text=True,
@@ -110,22 +110,25 @@ def test_export_is_identical_across_processes(tmp_path, exported):
     assert output.read_text(encoding="utf-8") == exported
 
 
-def test_generated_spec_is_ignored():
-    result = subprocess.run(
-        ["git", "check-ignore", "--no-index", "fern/openapi.yml"],
+@pytest.mark.parametrize(
+    "spec,script",
+    [("openapi.yml", "export_openapi.py"), ("hooks-openapi.yml", "export_hooks_openapi.py")],
+)
+def test_generated_spec_is_tracked_and_current(tmp_path, spec, script):
+    relative_path = f"fern/{spec}"
+    tracked = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", relative_path],
         cwd=ROOT,
         capture_output=True,
         text=True,
-        check=True,
-    )
-    assert result.stdout.strip() == "fern/openapi.yml"
-    tracked = subprocess.run(
-        ["git", "ls-files", "--error-unmatch", "fern/openapi.yml"],
-        cwd=ROOT,
-        capture_output=True,
         check=False,
     )
-    assert tracked.returncode != 0
+    assert tracked.returncode == 0, tracked.stdout + tracked.stderr
+    # A separate output path checks the contract without requiring generated health docs.
+    output = tmp_path / spec
+    output.write_bytes((ROOT / relative_path).read_bytes())
+    result = run_export(output, "--check", script=ROOT / "scripts" / script)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("status", [0, 1])
