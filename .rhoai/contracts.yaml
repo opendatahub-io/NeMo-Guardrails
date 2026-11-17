@@ -4,7 +4,11 @@ metadata:
   name: nemo-guardrails
 spec:
   baseline:
-    refs: ["5dadfe885adc9e698e9731c2919c947b05baac5f"]
+    refs:
+      # Required: refs/tags/release/odh-3.5, verified 2026-11-17.
+      - "623b1accc31ed0fa0c79b82a79cf5ba085f5d300"
+      # Additional: RHOAI 3.6 release base; central resolve verified 2026-11-17.
+      - "0ab8b3195fd8eed1d875a17f86adc6b696110795"
 
   contracts:
     - id: guardrails-api-v1
