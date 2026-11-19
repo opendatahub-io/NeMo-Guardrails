@@ -21,6 +21,14 @@ and workflow:
 The newer comparison supplements the GA baseline. Replacing a baseline with a
 later commit requires approval from someone other than the author.
 
+`guardrails-api-v1` has a per-contract baseline override at
+`8fb0585fc849e945e715092dfbe662c78c4a3760`. That commit is the first revision
+after `v0.25.0.rc1+rhaiv.1` that tracks the current OpenAPI specification, so
+it is the practical comparison point for the upstream API changes carried into
+RHAI 3.7. The override supersedes the repository baselines for that contract;
+the `odh-3.5` to `v0.25.0.rc1+rhaiv.1` differences are intentional upstream
+changes and are documented here rather than gated as breaks.
+
 Regenerate specs with `make docs-fern-generate-openapi` and commit them alongside
 source changes. The specification workflow fails if regeneration changes either
 tracked spec; do not edit generated specs manually.
