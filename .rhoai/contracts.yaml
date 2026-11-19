@@ -26,7 +26,7 @@ spec:
     - id: guardrails-hooks-api-v1
       type: openapi
       declaredArtifact: fern/hooks-openapi.yml
-      matchPath: "^/(v1|healthz)(/|$)"
+      matchPath: "^/v1/hooks(/|$)"
       generator:
         adapter: openapi.static
         source: fern/hooks-openapi.yml
