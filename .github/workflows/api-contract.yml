@@ -1,0 +1,46 @@
+# The ticket requires central @latest (v2.2.0 when verified).
+# Pinning policy: https://github.com/red-hat-data-services/api-contract-tests/blob/main/docs/releasing.md
+name: API contract
+
+on:
+  pull_request:
+    branches: [develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  api-contract:
+    strategy:
+      fail-fast: false
+      matrix:
+        contract-id:
+          - guardrails-api-v1
+          - guardrails-hooks-api-v1
+    uses: red-hat-data-services/api-contract-tests/.github/workflows/provider-openapi-check.yml@latest # zizmor: ignore[unpinned-uses]
+    with:
+      contract-set: .rhoai/contracts.yaml
+      contract-id: ${{ matrix.contract-id }}
+      # Required: refs/tags/release/odh-3.5, verified 2026-11-17.
+      # Additional: RHOAI 3.6 base, release_baseline.py resolve on 2026-11-17.
+      # Its spec matches release/odh-3.6.0 and v0.24.0.dev0+rhaiv.2.
+      # Newest tag v0.25.0.rc1+rhaiv.1 has no tracked specs: static checks
+      # report "new", not compatibility, so it adds no baseline protection.
+      baseline-refs: >-
+        623b1accc31ed0fa0c79b82a79cf5ba085f5d300
+        0ab8b3195fd8eed1d875a17f86adc6b696110795
+      oasdiff-version: "1.33.0"
+      yq-version: "4.45.1"
+      mode: enforce
+
+  api-contract-coverage:
+    uses: red-hat-data-services/api-contract-tests/.github/workflows/provider-coverage-check.yml@latest # zizmor: ignore[unpinned-uses]
+    with:
+      contract-set: .rhoai/contracts.yaml
+      # Same GA release tag and additional RHOAI 3.6 release base as above.
+      baseline-refs: >-
+        623b1accc31ed0fa0c79b82a79cf5ba085f5d300
+        0ab8b3195fd8eed1d875a17f86adc6b696110795
+      yq-version: "4.45.1"
+      mode: enforce

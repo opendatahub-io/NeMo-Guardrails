@@ -1,0 +1,3 @@
+# API contract policy changes require an owner review.
+/.rhoai/ @opendatahub-io/trustyai
+/.github/workflows/api-contract.yml @opendatahub-io/trustyai
