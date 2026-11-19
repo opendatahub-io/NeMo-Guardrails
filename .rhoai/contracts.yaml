@@ -14,8 +14,8 @@ spec:
     - id: guardrails-api-v1
       baseline:
         refs:
-          - "0f6f8ed30162117a355fd71b7e615f19d9501a46"
-        reason: Upstream NeMo Guardrails introduced these main API changes; they must be carried into RHAI 3.7
+          - "8fb0585fc849e945e715092dfbe662c78c4a3760"
+        reason: Upstream NeMo Guardrails API changes from v0.25.0.rc1+rhaiv.1 carried into RHAI 3.7
       type: openapi
       declaredArtifact: fern/openapi.yml
       matchPath: "^/(v1|healthz)(/|$)"
