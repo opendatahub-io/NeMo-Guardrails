@@ -77,9 +77,7 @@ docs/reference/python-api/generated/
 docs/_static/python-sdk-reference/
 .fern-cache/fern-ref-sdk/
 
-# Generated from the server source before Fern builds and publishing.
-/fern/openapi.yml
-/fern/hooks-openapi.yml
+# Generated reference pages are not part of the source tree.
 /docs/reference/hooks-server-api/_generated/
 /fern/proxy-openapi.yml
 /fern/proxy-guard-contracts/
