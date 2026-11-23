@@ -1,0 +1,34 @@
+name: Sync TrustyAI develop
+
+on:
+  schedule:
+    - cron: "37 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  sync:
+    if: github.repository == 'opendatahub-io/NeMo-Guardrails'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: sync-trustyai-develop-into-develop
+      cancel-in-progress: false
+    steps:
+      - name: Sync TrustyAI develop into ODH develop
+        uses: ruivieira/basic-ops-tasks@cdb560bd992944ab5ab656d6e8dbc0aa85bbb211
+        with:
+          mode: fork
+          upstream-repo: trustyai-explainability/NeMo-Guardrails
+          upstream-branch: develop
+          target-branch: develop
+          head-branch: sync/trustyai-develop-into-develop
+          merge-strategy: merge
+          allow-head-update: true
+          fail-on-conflict: true
+          labels: bot/sync-trustyai,tide/merge-method-merge
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
